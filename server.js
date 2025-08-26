@@ -1,4 +1,4 @@
-// server.js - Express server with Postgres + FUT.GG integration
+// server.js - Express server with Postgres + FUT.GG integration 
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
