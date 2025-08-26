@@ -438,25 +438,83 @@
     </div>
 
     <script>
-        // Mock SBC Dashboard Implementation
+        // Mock SBC Dashboard Implementation - Updated for Real API
         class SBCDashboardUI {
             constructor() {
                 this.solutions = new Map();
                 this.isLoading = false;
                 this.lastUpdate = null;
+                this.apiBase = window.location.origin; // Use current domain
             }
 
             async initialize() {
                 this.showStatus('Initializing SBC Dashboard...', 'loading');
                 
-                // Simulate initialization
-                await this.sleep(1000);
-                
-                this.showStatus('Dashboard ready!', 'success');
-                setTimeout(() => this.hideStatus(), 2000);
-                
-                // Load some mock solutions
-                await this.loadMockSolutions();
+                try {
+                    // Check if backend is ready
+                    const healthCheck = await this.checkHealth();
+                    
+                    if (!healthCheck.initialized) {
+                        this.showStatus('Backend is starting up, please wait...', 'loading');
+                        // Wait and retry
+                        await this.sleep(5000);
+                        return this.initialize();
+                    }
+                    
+                    this.showStatus('Dashboard ready!', 'success');
+                    setTimeout(() => this.hideStatus(), 2000);
+                    
+                    // Load real solutions from API
+                    await this.loadRealSolutions();
+                    
+                } catch (error) {
+                    console.error('Initialization error:', error);
+                    this.showStatus('Failed to connect to backend, using demo data', 'error');
+                    
+                    // Fallback to mock data
+                    setTimeout(() => {
+                        this.hideStatus();
+                        this.loadMockSolutions();
+                    }, 2000);
+                }
+            }
+
+            async checkHealth() {
+                try {
+                    const response = await fetch(`${this.apiBase}/api/health`);
+                    return await response.json();
+                } catch (error) {
+                    console.error('Health check failed:', error);
+                    return { initialized: false };
+                }
+            }
+
+            async loadRealSolutions() {
+                try {
+                    console.log('Loading real SBC solutions from API...');
+                    
+                    const response = await fetch(`${this.apiBase}/api/sbc/solutions`);
+                    
+                    if (!response.ok) {
+                        throw new Error(`API error: ${response.status}`);
+                    }
+                    
+                    const solutions = await response.json();
+                    
+                    // Convert API response to our display format
+                    this.solutions.clear();
+                    for (const solution of solutions) {
+                        this.solutions.set(solution.sbcName, solution);
+                    }
+                    
+                    console.log(`✅ Loaded ${this.solutions.size} real solutions`);
+                    this.renderSolutions();
+                    this.updateStats();
+                    
+                } catch (error) {
+                    console.error('Error loading real solutions:', error);
+                    throw error;
+                }
             }
 
             async loadMockSolutions() {
@@ -643,17 +701,22 @@
                 this.showStatus('Finding optimal solutions...', 'loading');
 
                 try {
-                    // Simulate API calls and calculations
-                    await this.sleep(3000);
-                    
-                    // Refresh solutions (in real implementation, this would call the SBC solver)
-                    await this.loadMockSolutions();
+                    // Try to load real solutions from API
+                    await this.loadRealSolutions();
                     
                     this.lastUpdate = new Date();
                     this.showStatus('All solutions updated successfully!', 'success');
                     setTimeout(() => this.hideStatus(), 3000);
+                    
                 } catch (error) {
-                    this.showStatus('Error finding solutions: ' + error.message, 'error');
+                    console.error('Error finding solutions:', error);
+                    this.showStatus('API unavailable, showing demo data', 'error');
+                    
+                    // Fallback to mock data
+                    setTimeout(() => {
+                        this.loadMockSolutions();
+                        this.hideStatus();
+                    }, 2000);
                 } finally {
                     this.isLoading = false;
                     this.updateFindButton(false);
@@ -663,25 +726,52 @@
             async updatePrices() {
                 this.showStatus('Updating player prices...', 'loading');
                 
-                // Simulate price updates
-                await this.sleep(2000);
-                
-                // Update costs slightly
-                for (const [name, solution] of this.solutions) {
-                    const variation = (Math.random() - 0.5) * 0.1; // ±5%
-                    if (solution.isMultiSegment) {
-                        solution.totalCost = Math.round(solution.totalCost * (1 + variation));
-                        for (const [segmentName, segment] of solution.segments) {
-                            segment.totalCost = Math.round(segment.totalCost * (1 + variation));
+                try {
+                    // Try to trigger real price update
+                    const response = await fetch(`${this.apiBase}/api/sbc/update-prices`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
                         }
+                    });
+                    
+                    if (response.ok) {
+                        const result = await response.json();
+                        this.showStatus(`✅ Updated ${result.updated || 0} player prices`, 'success');
+                        
+                        // Refresh solutions after price update
+                        setTimeout(async () => {
+                            await this.loadRealSolutions();
+                            this.updateStats();
+                        }, 1000);
+                        
                     } else {
-                        solution.solution.totalCost = Math.round(solution.solution.totalCost * (1 + variation));
+                        throw new Error('Price update failed');
                     }
+                    
+                } catch (error) {
+                    console.error('Price update error:', error);
+                    
+                    // Simulate price updates as fallback
+                    await this.sleep(2000);
+                    
+                    // Update costs slightly for demo
+                    for (const [name, solution] of this.solutions) {
+                        const variation = (Math.random() - 0.5) * 0.1; // ±5%
+                        if (solution.isMultiSegment) {
+                            solution.totalCost = Math.round(solution.totalCost * (1 + variation));
+                            for (const [segmentName, segment] of solution.segments) {
+                                segment.totalCost = Math.round(segment.totalCost * (1 + variation));
+                            }
+                        } else {
+                            solution.solution.totalCost = Math.round(solution.solution.totalCost * (1 + variation));
+                        }
+                    }
+                    
+                    this.renderSolutions();
+                    this.showStatus('Demo price update completed', 'success');
                 }
                 
-                this.renderSolutions();
-                this.updateStats();
-                this.showStatus('Prices updated successfully!', 'success');
                 setTimeout(() => this.hideStatus(), 2000);
             }
 
