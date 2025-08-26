@@ -1,0 +1,990 @@
+createSolutionCard(name, solution) {
+                const card = document.createElement('div');
+                card.className = 'solution-card';
+                
+                if (solution.isMultiSegment) {
+                    return this.createMultiSegmentCard(name, solution);
+                } else {
+                    return this.createSingleSegmentCard(name, solution);
+                }
+            }
+
+            createMultiSegmentCard(name, solution) {
+                const card = document.createElement('div');
+                card.className = 'solution-card multi-segment';
+                
+                const costFormatted = (solution.totalCost / 1000).toFixed(0) + 'k';
+                const segmentCount = solution.segments.size;
+                
+                let segmentsHTML = '';
+                for (const [segmentName, segment] of solution.segments) {
+                    const segmentCost = (segment.totalCost / 1000).toFixed(0) + 'k';
+                    const playersPreview = segment.cheapestPlayers.slice(0, 3).map(p => 
+                        `${p.name} (${p.rating})`
+                    ).join(', ');
+                    
+                    segmentsHTML += `
+                        <div class="segment-item">
+                            <div class="segment-header">
+                                <span class="segment-name">${segmentName}</span>
+                                <span class="segment-cost">${segmentCost}</span>
+                            </div>
+                            <div class="segment-requirements">
+                                ${segment.requirements.map(req => `<span class="req-tag">${req}</span>`).join('')}
+                            </div>
+                            <div class="segment-players-preview">
+                                <strong>Cheapest options:</strong> ${playersPreview}${segment.cheapestPlayers.length > 3 ? '...' : ''}
+                            </div>
+                            <div class="segment-reward">
+                                <span class="reward-icon">🎁</span> ${segment.reward}
+                            </div>
+                        </div>
+                    `;
+                }
+                
+                card.innerHTML = `
+                    <div class="solution-header">
+                        <div class="solution-title">${name}</div>
+                        <div class="solution-cost">${costFormatted} coins</div>
+                    </div>
+                    
+                    <div class="solution-meta">
+                        <div class="meta-item">
+                            <div class="meta-label">Segments</div>
+                            <div class="meta-value">${segmentCount}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Expiry</div>
+                            <div class="meta-value">${solution.expiry}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Total Cost</div>
+                            <div class="meta-value">${costFormatted}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="completion-reward">
+                        <strong>🏆 Completion Reward:</strong> ${solution.completionReward}
+                    </div>
+                    
+                    <div class="segments-container">
+                        ${segmentsHTML}
+                    </div>
+                `;
+                
+                return card;
+            }
+
+            createSingleSegmentCard(name, solution) {
+                const card = document.createElement('div');
+                card.className = 'solution-card single-segment';
+                
+                const costFormatted = (solution.solution.totalCost / 1000).toFixed(0) + 'k';
+                
+                card.innerHTML = `
+                    <div class="solution-header">
+                        <div class="solution-title">${name}</div>
+                        <div class="solution-cost">${costFormatted} coins</div>
+                    </div>
+                    
+                    <div class="solution-meta">
+                        <div class="meta-item">
+                            <div class="meta-label">Rating</div>
+                            <div class="meta-value">${solution.solution.rating}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Chemistry</div>
+                            <div class="meta-value">${solution.solution.chemistry}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Players</div>
+                            <div class="meta-value">${solution.solution.squad.length}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="requirements-list">
+                        ${solution.requirements.map(req => `
+                            <div class="requirement-item">
+                                <span>${req}</span>
+                                <span style="color: #28a745;">✓</span>
+                            </div>
+                        `).join('')}
+                    </div>
+                    
+                    <div class="squad-preview">
+                        <strong>Squad Formation:</strong>
+                        <div class="squad-formation">
+                            ${solution.solution.squad.map(player => `
+                                <div class="player-slot" title="${player.name} - ${(player.price/1000).toFixed(0)}k coins">
+                                    <div class="player-name">${player.name.split(' ').pop()}</div>
+                                    <div class="player-rating">${player.rating}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+                
+                return card;
+            }<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FC25 SBC Solutions Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Arial', sans-serif;
+            background: linear-gradient(135deg, #1a1a2e, #16213e, #0f3460);
+            color: white;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            background: rgba(255,255,255,0.1);
+            padding: 30px;
+            border-radius: 15px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+            background: linear-gradient(45deg, #00d4ff, #ff6b35);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.8;
+        }
+
+        .controls {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+
+        .search-box {
+            flex: 1;
+            min-width: 250px;
+        }
+
+        .search-box input {
+            width: 100%;
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.1);
+            color: white;
+            font-size: 16px;
+            backdrop-filter: blur(10px);
+        }
+
+        .search-box input::placeholder {
+            color: rgba(255,255,255,0.6);
+        }
+
+        .btn {
+            padding: 15px 25px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(45deg, #00d4ff, #0099cc);
+            color: white;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: bold;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,212,255,0.4);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .btn.secondary {
+            background: linear-gradient(45deg, #ff6b35, #f7931e);
+        }
+
+        .btn.secondary:hover {
+            box-shadow: 0 5px 15px rgba(255,107,53,0.4);
+        }
+
+        .status {
+            text-align: center;
+            margin: 20px 0;
+            padding: 15px;
+            border-radius: 10px;
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+        }
+
+        .status.loading {
+            background: rgba(255,193,7,0.2);
+            border: 1px solid rgba(255,193,7,0.3);
+        }
+
+        .status.success {
+            background: rgba(40,167,69,0.2);
+            border: 1px solid rgba(40,167,69,0.3);
+        }
+
+        .status.error {
+            background: rgba(220,53,69,0.2);
+            border: 1px solid rgba(220,53,69,0.3);
+        }
+
+        .solutions-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 25px;
+            margin-top: 30px;
+        }
+
+        .solution-card {
+            background: rgba(255,255,255,0.1);
+            border-radius: 15px;
+            padding: 25px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255,255,255,0.1);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .solution-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+
+        .solution-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .solution-title {
+            font-size: 1.3rem;
+            font-weight: bold;
+            color: #00d4ff;
+        }
+
+        .solution-cost {
+            font-size: 1.5rem;
+            font-weight: bold;
+            color: #28a745;
+        }
+
+        .solution-meta {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+
+        .meta-item {
+            text-align: center;
+            padding: 10px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+        }
+
+        .meta-label {
+            font-size: 0.8rem;
+            opacity: 0.7;
+            margin-bottom: 5px;
+        }
+
+        .meta-value {
+            font-size: 1.1rem;
+            font-weight: bold;
+        }
+
+        .squad-preview {
+            margin-top: 20px;
+        }
+
+        .squad-formation {
+            display: grid;
+            grid-template-columns: repeat(11, 1fr);
+            gap: 5px;
+            margin-top: 15px;
+        }
+
+        .player-slot {
+            aspect-ratio: 1;
+            background: linear-gradient(45deg, #2c3e50, #34495e);
+            border-radius: 8px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            font-size: 0.7rem;
+            text-align: center;
+            border: 1px solid rgba(255,255,255,0.2);
+            transition: transform 0.2s;
+        }
+
+        .player-slot:hover {
+            transform: scale(1.05);
+            background: linear-gradient(45deg, #3498db, #2980b9);
+        }
+
+        .player-name {
+            font-weight: bold;
+            margin-bottom: 2px;
+        }
+
+        .player-rating {
+            color: #f1c40f;
+            font-size: 0.8rem;
+        }
+
+        .multi-segment {
+            border-left: 4px solid #ff6b35;
+        }
+
+        .single-segment {
+            border-left: 4px solid #00d4ff;
+        }
+
+        .completion-reward {
+            background: linear-gradient(45deg, rgba(255,215,0,0.2), rgba(255,140,0,0.2));
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255,215,0,0.3);
+            text-align: center;
+            font-weight: bold;
+        }
+
+        .segments-container {
+            max-height: 400px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+
+        .segment-item {
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border: 1px solid rgba(255,255,255,0.1);
+            transition: background 0.2s;
+        }
+
+        .segment-item:hover {
+            background: rgba(255,255,255,0.1);
+        }
+
+        .segment-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .segment-name {
+            font-weight: bold;
+            color: #ff6b35;
+            font-size: 1.1rem;
+        }
+
+        .segment-cost {
+            font-weight: bold;
+            color: #28a745;
+            font-size: 1.1rem;
+        }
+
+        .segment-requirements {
+            margin-bottom: 10px;
+        }
+
+        .req-tag {
+            display: inline-block;
+            background: rgba(0,212,255,0.2);
+            color: #00d4ff;
+            padding: 3px 8px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            margin-right: 8px;
+            margin-bottom: 4px;
+            border: 1px solid rgba(0,212,255,0.3);
+        }
+
+        .segment-players-preview {
+            font-size: 0.9rem;
+            margin-bottom: 10px;
+            opacity: 0.9;
+        }
+
+        .segment-reward {
+            color: #f1c40f;
+            font-size: 0.9rem;
+            font-weight: bold;
+        }
+
+        .reward-icon {
+            margin-right: 5px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .requirements-list {
+            margin-top: 15px;
+        }
+
+        .requirement-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+        }
+
+        .requirement-item:last-child {
+            border-bottom: none;
+        }
+
+        .stats-overview {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+
+        .stat-card {
+            background: rgba(255,255,255,0.1);
+            padding: 20px;
+            border-radius: 10px;
+            text-align: center;
+            backdrop-filter: blur(10px);
+        }
+
+        .stat-number {
+            font-size: 2rem;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            opacity: 0.8;
+        }
+
+        @media (max-width: 768px) {
+            .controls {
+                flex-direction: column;
+            }
+            
+            .solutions-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .squad-formation {
+                grid-template-columns: repeat(4, 1fr);
+                gap: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>FC25 SBC Solutions</h1>
+            <p>Find the cheapest solutions for Squad Building Challenges</p>
+        </div>
+
+        <div class="stats-overview">
+            <div class="stat-card">
+                <div class="stat-number" id="totalSBCs">0</div>
+                <div class="stat-label">Active SBCs</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="totalSolutions">0</div>
+                <div class="stat-label">Total Segments</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="averageCost">0k</div>
+                <div class="stat-label">Avg. Cost</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-number" id="lastUpdate">Never</div>
+                <div class="stat-label">Last Update</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <div class="search-box">
+                <input type="text" id="sbcSearch" placeholder="Search for specific SBC...">
+            </div>
+            <button class="btn" onclick="findAllSolutions()">
+                <span id="findAllText">Find All Solutions</span>
+                <span id="loadingSpinner" class="loading-spinner" style="display: none;"></span>
+            </button>
+            <button class="btn secondary" onclick="updatePrices()">Update Prices</button>
+            <button class="btn secondary" onclick="exportSolutions()">Export CSV</button>
+        </div>
+
+        <div id="status" class="status" style="display: none;"></div>
+
+        <div id="solutionsContainer" class="solutions-grid">
+            <!-- Solutions will be populated here -->
+        </div>
+    </div>
+
+    <script>
+        // Mock SBC Dashboard Implementation
+        class SBCDashboardUI {
+            constructor() {
+                this.solutions = new Map();
+                this.isLoading = false;
+                this.lastUpdate = null;
+            }
+
+            async initialize() {
+                this.showStatus('Initializing SBC Dashboard...', 'loading');
+                
+                // Simulate initialization
+                await this.sleep(1000);
+                
+                this.showStatus('Dashboard ready!', 'success');
+                setTimeout(() => this.hideStatus(), 2000);
+                
+                // Load some mock solutions
+                await this.loadMockSolutions();
+            }
+
+            async loadMockSolutions() {
+                const mockSolutions = [
+                    // Multi-segment SBC
+                    {
+                        sbcName: 'Icon Moments Ronaldinho',
+                        isMultiSegment: true,
+                        totalCost: 450000,
+                        segments: new Map([
+                            ['Born Legend', {
+                                segmentName: 'Born Legend',
+                                totalCost: 25000,
+                                cheapestPlayers: [
+                                    { name: 'Matheus Nunes', rating: 83, position: 'CM', league: 'Premier League', price: 2800 },
+                                    { name: 'Timber', rating: 83, position: 'CB', league: 'Premier League', price: 2600 },
+                                    { name: 'Soucek', rating: 83, position: 'CDM', league: 'Premier League', price: 2200 },
+                                    { name: 'Fabianski', rating: 83, position: 'GK', league: 'Premier League', price: 2000 },
+                                    { name: 'Antonio', rating: 83, position: 'ST', league: 'Premier League', price: 2400 }
+                                ],
+                                requirements: ['Min Rating: 83', 'Exact Players: 11', 'Min Chemistry: 95'],
+                                reward: 'Small Rare Gold Pack'
+                            }],
+                            ['Rising Talent', {
+                                segmentName: 'Rising Talent',
+                                totalCost: 85000,
+                                cheapestPlayers: [
+                                    { name: 'Alisson', rating: 89, position: 'GK', price: 15000 },
+                                    { name: 'Walker', rating: 85, position: 'RB', price: 8500 },
+                                    { name: 'Van Dijk', rating: 90, position: 'CB', price: 25000 },
+                                    { name: 'Konate', rating: 84, position: 'CB', price: 4500 },
+                                    { name: 'Robertson', rating: 87, position: 'LB', price: 11000 },
+                                    { name: 'Fabinho', rating: 85, position: 'CDM', price: 6000 },
+                                    { name: 'Henderson', rating: 84, position: 'CM', price: 3500 },
+                                    { name: 'Thiago', rating: 86, position: 'CM', price: 8500 },
+                                    { name: 'Salah', rating: 89, position: 'RW', price: 35000 },
+                                    { name: 'Nunez', rating: 82, position: 'ST', price: 3000 },
+                                    { name: 'Diaz', rating: 84, position: 'LW', price: 5000 }
+                                ],
+                                requirements: ['Min Team Rating: 84', 'Min Chemistry: 95', 'Exactly 1 League'],
+                                reward: 'Prime Mixed Players Pack'
+                            }],
+                            ['Top Form', {
+                                segmentName: 'Top Form',
+                                totalCost: 165000,
+                                cheapestPlayers: [
+                                    { name: 'Courtois', rating: 89, position: 'GK', price: 12000 },
+                                    { name: 'Carvajal', rating: 86, position: 'RB', price: 8000 },
+                                    { name: 'Militao', rating: 85, position: 'CB', price: 7500 },
+                                    { name: 'Alaba', rating: 86, position: 'CB', price: 9000 },
+                                    { name: 'Mendy', rating: 82, position: 'LB', price: 3000 },
+                                    { name: 'Tchouameni', rating: 84, position: 'CDM', price: 5500 },
+                                    { name: 'Modric', rating: 88, position: 'CM', price: 15000 },
+                                    { name: 'Bellingham IF', rating: 87, position: 'CM', price: 45000 }, // IF Player
+                                    { name: 'Rodrygo', rating: 85, position: 'RW', price: 12000 },
+                                    { name: 'Benzema', rating: 87, position: 'ST', price: 18000 },
+                                    { name: 'Vinicius Jr', rating: 86, position: 'LW', price: 25000 }
+                                ],
+                                requirements: ['Min Team Rating: 86', 'Min Chemistry: 95', 'Min 1 IF Player'],
+                                reward: 'Jumbo Rare Players Pack'
+                            }],
+                            ['World Class', {
+                                segmentName: 'World Class',
+                                totalCost: 175000,
+                                cheapestPlayers: [
+                                    { name: 'Neuer', rating: 90, position: 'GK', price: 18000 },
+                                    { name: 'Kimmich', rating: 89, position: 'RB', price: 22000 },
+                                    { name: 'De Ligt', rating: 85, position: 'CB', price: 8000 },
+                                    { name: 'Upamecano', rating: 84, position: 'CB', price: 4500 },
+                                    { name: 'Davies', rating: 84, position: 'LB', price: 5500 },
+                                    { name: 'Goretzka', rating: 87, position: 'CDM', price: 12000 },
+                                    { name: 'Musiala', rating: 84, position: 'CM', price: 8000 },
+                                    { name: 'Muller', rating: 87, position: 'CM', price: 11000 },
+                                    { name: 'Sane', rating: 86, position: 'RW', price: 13000 },
+                                    { name: 'Base Pele', rating: 89, position: 'ST', price: 85000 }, // Icon
+                                    { name: 'Coman', rating: 84, position: 'LW', price: 6000 }
+                                ],
+                                requirements: ['Min Team Rating: 87', 'Min Chemistry: 95', 'Min 1 Icon'],
+                                reward: 'Ultimate Pack'
+                            }]
+                        ]),
+                        completionReward: 'Icon Moments Ronaldinho (94 OVR)',
+                        expiry: '14 days',
+                        lastUpdated: new Date()
+                    },
+                    // Regular single-segment SBC
+                    {
+                        sbcName: 'First XI',
+                        isMultiSegment: false,
+                        solution: {
+                            totalCost: 45000,
+                            chemistry: 100,
+                            rating: 82,
+                            squad: [
+                                { name: 'Courtois', rating: 89, position: 'GK', price: 12000 },
+                                { name: 'Carvajal', rating: 86, position: 'RB', price: 8000 },
+                                { name: 'Militao', rating: 85, position: 'CB', price: 7500 },
+                                { name: 'Alaba', rating: 86, position: 'CB', price: 9000 },
+                                { name: 'Mendy', rating: 82, position: 'LB', price: 3000 },
+                                { name: 'Tchouameni', rating: 84, position: 'CDM', price: 5500 },
+                                { name: 'Modric', rating: 88, position: 'CM', price: 15000 },
+                                { name: 'Kroos', rating: 88, position: 'CM', price: 14000 },
+                                { name: 'Rodrygo', rating: 85, position: 'RW', price: 12000 },
+                                { name: 'Benzema', rating: 87, position: 'ST', price: 18000 },
+                                { name: 'Vinicius Jr', rating: 86, position: 'LW', price: 25000 }
+                            ]
+                        },
+                        lastUpdated: new Date(),
+                        requirements: [
+                            'Min. Team Rating: 82',
+                            'Min. Team Chemistry: 95',
+                            'Exactly 1 Club'
+                        ]
+                    },
+                    // Multi-segment POTM
+                    {
+                        sbcName: 'POTM Bruno Fernandes',
+                        isMultiSegment: true,
+                        totalCost: 125000,
+                        segments: new Map([
+                            ['Liga Portugal', {
+                                segmentName: 'Liga Portugal',
+                                totalCost: 35000,
+                                cheapestPlayers: [
+                                    { name: 'Diogo Costa', rating: 83, position: 'GK', league: 'Liga Portugal', price: 2800 },
+                                    { name: 'Pepe', rating: 86, position: 'CB', league: 'Liga Portugal', price: 8500 },
+                                    { name: 'Otavio', rating: 84, position: 'CM', league: 'Liga Portugal', price: 4200 },
+                                    { name: 'Bruno Fernandes', rating: 88, position: 'CM', league: 'Liga Portugal', price: 18500 },
+                                    { name: 'Taremi', rating: 84, position: 'ST', league: 'Liga Portugal', price: 3800 }
+                                ],
+                                requirements: ['Min Team Rating: 83', 'Liga Portugal Only', 'Min Chemistry: 95'],
+                                reward: 'Rare Mixed Players Pack'
+                            }],
+                            ['Premier League', {
+                                segmentName: 'Premier League', 
+                                totalCost: 75000,
+                                cheapestPlayers: [
+                                    { name: 'De Gea', rating: 87, position: 'GK', league: 'Premier League', price: 8000 },
+                                    { name: 'Wan-Bissaka', rating: 82, position: 'RB', league: 'Premier League', price: 2500 },
+                                    { name: 'Maguire', rating: 84, position: 'CB', league: 'Premier League', price: 3500 },
+                                    { name: 'Martinez', rating: 84, position: 'CB', league: 'Premier League', price: 4500 },
+                                    { name: 'Shaw', rating: 85, position: 'LB', league: 'Premier League', price: 5500 },
+                                    { name: 'Casemiro', rating: 84, position: 'CDM', league: 'Premier League', price: 3500 },
+                                    { name: 'Eriksen', rating: 84, position: 'CM', league: 'Premier League', price: 3000 },
+                                    { name: 'Bruno Fernandes', rating: 88, position: 'CM', league: 'Premier League', price: 15000 },
+                                    { name: 'Antony', rating: 82, position: 'RW', league: 'Premier League', price: 2800 },
+                                    { name: 'Rashford', rating: 86, position: 'ST', league: 'Premier League', price: 18000 },
+                                    { name: 'Garnacho', rating: 77, position: 'LW', league: 'Premier League', price: 1200 }
+                                ],
+                                requirements: ['Min Team Rating: 85', 'Premier League Only', 'Min Chemistry: 95'],
+                                reward: 'Prime Mixed Players Pack'
+                            }],
+                            ['Top Quality', {
+                                segmentName: 'Top Quality',
+                                totalCost: 15000,
+                                cheapestPlayers: [
+                                    { name: 'Lewandowski', rating: 89, position: 'ST', price: 8500 },
+                                    { name: 'Kane', rating: 89, position: 'ST', price: 7200 },
+                                    { name: 'Benzema', rating: 87, position: 'ST', price: 6800 }
+                                ],
+                                requirements: ['Min Rating: 86', 'Exactly 3 Players'],
+                                reward: 'Small Prime Gold Players Pack'
+                            }]
+                        ]),
+                        completionReward: 'POTM Bruno Fernandes (87 OVR)',
+                        expiry: '7 days',
+                        lastUpdated: new Date()
+                    }
+                ];
+
+                for (const solution of mockSolutions) {
+                    this.solutions.set(solution.sbcName, solution);
+                }
+
+                this.renderSolutions();
+                this.updateStats();
+            }
+
+            async findAllSolutions() {
+                if (this.isLoading) return;
+                
+                this.isLoading = true;
+                this.updateFindButton(true);
+                this.showStatus('Finding optimal solutions...', 'loading');
+
+                try {
+                    // Simulate API calls and calculations
+                    await this.sleep(3000);
+                    
+                    // Refresh solutions (in real implementation, this would call the SBC solver)
+                    await this.loadMockSolutions();
+                    
+                    this.lastUpdate = new Date();
+                    this.showStatus('All solutions updated successfully!', 'success');
+                    setTimeout(() => this.hideStatus(), 3000);
+                } catch (error) {
+                    this.showStatus('Error finding solutions: ' + error.message, 'error');
+                } finally {
+                    this.isLoading = false;
+                    this.updateFindButton(false);
+                }
+            }
+
+            async updatePrices() {
+                this.showStatus('Updating player prices...', 'loading');
+                
+                // Simulate price updates
+                await this.sleep(2000);
+                
+                // Update costs slightly
+                for (const [name, solution] of this.solutions) {
+                    const variation = (Math.random() - 0.5) * 0.1; // ±5%
+                    solution.solution.totalCost = Math.round(solution.solution.totalCost * (1 + variation));
+                }
+                
+                this.renderSolutions();
+                this.updateStats();
+                this.showStatus('Prices updated successfully!', 'success');
+                setTimeout(() => this.hideStatus(), 2000);
+            }
+
+            exportSolutions() {
+                let csv = 'SBC Name,Total Cost,Rating,Chemistry,Requirements\n';
+                
+                for (const [name, solution] of this.solutions) {
+                    const req = solution.requirements.join('; ');
+                    csv += `"${name}",${solution.solution.totalCost},${solution.solution.rating},${solution.solution.chemistry},"${req}"\n`;
+                }
+                
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `sbc-solutions-${new Date().toISOString().split('T')[0]}.csv`;
+                a.click();
+                window.URL.revokeObjectURL(url);
+            }
+
+            renderSolutions() {
+                const container = document.getElementById('solutionsContainer');
+                container.innerHTML = '';
+
+                for (const [name, solution] of this.solutions) {
+                    const card = this.createSolutionCard(name, solution);
+                    container.appendChild(card);
+                }
+            }
+
+            createSolutionCard(name, solution) {
+                const card = document.createElement('div');
+                card.className = 'solution-card';
+                
+                const costFormatted = (solution.solution.totalCost / 1000).toFixed(0) + 'k';
+                
+                card.innerHTML = `
+                    <div class="solution-header">
+                        <div class="solution-title">${name}</div>
+                        <div class="solution-cost">${costFormatted} coins</div>
+                    </div>
+                    
+                    <div class="solution-meta">
+                        <div class="meta-item">
+                            <div class="meta-label">Rating</div>
+                            <div class="meta-value">${solution.solution.rating}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Chemistry</div>
+                            <div class="meta-value">${solution.solution.chemistry}</div>
+                        </div>
+                        <div class="meta-item">
+                            <div class="meta-label">Players</div>
+                            <div class="meta-value">${solution.solution.squad.length}</div>
+                        </div>
+                    </div>
+                    
+                    <div class="requirements-list">
+                        ${solution.requirements.map(req => `
+                            <div class="requirement-item">
+                                <span>${req}</span>
+                                <span style="color: #28a745;">✓</span>
+                            </div>
+                        `).join('')}
+                    </div>
+                    
+                    <div class="squad-preview">
+                        <strong>Squad Formation:</strong>
+                        <div class="squad-formation">
+                            ${solution.solution.squad.map(player => `
+                                <div class="player-slot" title="${player.name} - ${(player.price/1000).toFixed(0)}k coins">
+                                    <div class="player-name">${player.name.split(' ').pop()}</div>
+                                    <div class="player-rating">${player.rating}</div>
+                                </div>
+                            `).join('')}
+                        </div>
+                    </div>
+                `;
+                
+                return card;
+            }
+
+            updateStats() {
+                const totalSBCs = this.solutions.size;
+                document.getElementById('totalSBCs').textContent = totalSBCs;
+                document.getElementById('totalSolutions').textContent = totalSBCs;
+                
+                if (totalSBCs > 0) {
+                    let totalCost = 0;
+                    let segmentCount = 0;
+                    
+                    for (const solution of this.solutions.values()) {
+                        if (solution.isMultiSegment) {
+                            totalCost += solution.totalCost;
+                            segmentCount += solution.segments.size;
+                        } else {
+                            totalCost += solution.solution.totalCost;
+                            segmentCount += 1;
+                        }
+                    }
+                    
+                    const avgCost = Math.round(totalCost / totalSBCs / 1000);
+                    document.getElementById('averageCost').textContent = avgCost + 'k';
+                    
+                    // Update total segments stat
+                    document.getElementById('totalSolutions').textContent = segmentCount;
+                }
+                
+                if (this.lastUpdate) {
+                    const timeAgo = this.getTimeAgo(this.lastUpdate);
+                    document.getElementById('lastUpdate').textContent = timeAgo;
+                }
+            }
+
+            updateFindButton(loading) {
+                const text = document.getElementById('findAllText');
+                const spinner = document.getElementById('loadingSpinner');
+                
+                if (loading) {
+                    text.style.display = 'none';
+                    spinner.style.display = 'inline-block';
+                } else {
+                    text.style.display = 'inline';
+                    spinner.style.display = 'none';
+                }
+            }
+
+            showStatus(message, type) {
+                const status = document.getElementById('status');
+                status.textContent = message;
+                status.className = `status ${type}`;
+                status.style.display = 'block';
+            }
+
+            hideStatus() {
+                const status = document.getElementById('status');
+                status.style.display = 'none';
+            }
+
+            getTimeAgo(date) {
+                const now = new Date();
+                const diffMs = now - date;
+                const diffMins = Math.floor(diffMs / 60000);
+                
+                if (diffMins < 1) return 'Just now';
+                if (diffMins < 60) return `${diffMins}m ago`;
+                
+                const diffHours = Math.floor(diffMins / 60);
+                if (diffHours < 24) return `${diffHours}h ago`;
+                
+                const diffDays = Math.floor(diffHours / 24);
+                return `${diffDays}d ago`;
+            }
+
+            sleep(ms) {
+                return new Promise(resolve => setTimeout(resolve, ms));
+            }
+        }
+
+        // Global functions
+        const dashboard = new SBCDashboardUI();
+
+        function findAllSolutions() {
+            dashboard.findAllSolutions();
+        }
+
+        function updatePrices() {
+            dashboard.updatePrices();
+        }
+
+        function exportSolutions() {
+            dashboard.exportSolutions();
+        }
+
+        // Initialize on page load
+        window.addEventListener('load', () => {
+            dashboard.initialize();
+        });
+
+        // Search functionality
+        document.getElementById('sbcSearch').addEventListener('input', function(e) {
+            const searchTerm = e.target.value.toLowerCase();
+            const cards = document.querySelectorAll('.solution-card');
+            
+            cards.forEach(card => {
+                const title = card.querySelector('.solution-title').textContent.toLowerCase();
+                if (title.includes(searchTerm)) {
+                    card.style.display = 'block';
+                } else {
+                    card.style.display = 'none';
+                }
+            });
+        });
+    </script>
+</body>
+</html>
