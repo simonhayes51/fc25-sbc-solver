@@ -1,541 +1,410 @@
-// server.js - Express server with Postgres + FUT.GG integration
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const cron = require('node-cron');
+// server.js
+"use strict";
 
-// Import Postgres-based SBC solver and live SBC scraper
-const { PostgresSBCSolver } = require('./src/postgres-futgg-integration');
-const LiveSBCScraper = require('./src/live-sbc-scraper');
+/**
+ * FC25 SBC Solution Finder API (multi-segment)
+ *
+ * Features:
+ * - Express + CORS + JSON parsing
+ * - Health & diagnostics endpoints
+ * - In-memory cache helper with TTL
+ * - Optional PostgreSQL persistence (Railway DATABASE_URL)
+ * - node-cron task to prune old rows
+ * - POST /api/sbc/solve to build squads for 1..N segments
+ *
+ * Post body schema (example):
+ * {
+ *   "segments": [
+ *     {
+ *       "name": "England Gold",
+ *       "requirements": {
+ *         "minOverall": 80,
+ *         "maxOverall": 99,            // optional
+ *         "minChemistry": 20,          // optional - soft placeholder
+ *         "minNationCount": { "ENG": 3 },
+ *         "minLeagueCount": { "Premier League": 4 },
+ *         "minClubCount": { "Arsenal": 1 },
+ *         "positions": ["GK","RB","CB","CB","LB","CM","CM","CAM","RW","LW","ST"], // target formation/slots (11)
+ *         "minRare": 0,                // optional
+ *         "allowDuplicates": false     // optional, default false
+ *       }
+ *     }
+ *   ],
+ *   "candidates": [
+ *     {
+ *       "id": 100664475,
+ *       "name": "Bukayo Saka",
+ *       "rating": 86,
+ *       "position": "RW",             // canonical pos
+ *       "altPositions": ["RM","LW"],  // optional
+ *       "nation": "ENG",
+ *       "league": "Premier League",
+ *       "club": "Arsenal",
+ *       "rare": true,                 // optional
+ *       "chemLinks": {                // optional lightweight chemistry hints
+ *         "nation": true,
+ *         "league": true,
+ *         "club": true
+ *       },
+ *       "price": 18000                // optional, used for cheapest
+ *     }
+ *   ],
+ *   "options": {
+ *     "objective": "cheapest",        // "cheapest" | "highest" | "balanced"
+ *     "preferAltPositions": true      // use altPositions to satisfy slots
+ *   }
+ * }
+ *
+ * Response:
+ * {
+ *   "ok": true,
+ *   "solutions": [
+ *     {
+ *       "segment": "England Gold",
+ *       "status": "ok",
+ *       "squad": [ {player}, ... 11 ],
+ *       "summary": {
+ *         "cost": 123456,
+ *         "avgRating": 83.5,
+ *         "nationCounts": {...},
+ *         "leagueCounts": {...},
+ *         "clubCounts": {...},
+ *         "chemEstimate": 24
+ *       }
+ *     }
+ *   ]
+ * }
+ */
 
-const app = express();
+const express = require("express");
+const cors = require("cors");
+const axios = require("axios"); // kept for future expansion (e.g., fetching external data)
+const _ = require("lodash");
+const cron = require("node-cron");
+const { Pool } = require("pg");
+
+// ---------- Config ----------
 const PORT = process.env.PORT || 3000;
+const HOST = "0.0.0.0";
+const NODE_ENV = process.env.NODE_ENV || "production";
+const ALLOW_ORIGIN = process.env.ALLOW_ORIGIN || "*";
+const DATABASE_URL = process.env.DATABASE_URL || "";
 
-// Middleware
-app.use(cors());
-app.use(express.json());
-app.use(express.static('public'));
+// ---------- App ----------
+const app = express();
+app.use(cors({ origin: ALLOW_ORIGIN, credentials: true }));
+app.use(express.json({ limit: "1mb" }));
 
-// Initialize SBC systems with Postgres and live scraper
-const sbcSolver = new PostgresSBCSolver();
-const liveSBCScraper = new LiveSBCScraper();
-let isInitialized = false;
-
-// Initialize on startup
-async function initializeSystem() {
-    if (isInitialized) return;
-    
-    try {
-        console.log('🚀 Initializing SBC System...');
-        
-        // Check if database is configured
-        if (!process.env.DATABASE_URL) {
-            console.log('⚠️ No DATABASE_URL found, running in demo mode');
-            isInitialized = true;
-            return;
-        }
-        
-        console.log('💾 Database URL found, connecting to Postgres...');
-        await sbcSolver.initialize();
-        console.log('✅ SBC System ready with real data!');
-        isInitialized = true;
-        
-    } catch (error) {
-        console.error('❌ Database initialization failed:', error.message);
-        console.log('🔄 Falling back to demo mode...');
-        
-        // Initialize in demo mode
-        isInitialized = true;
-        console.log('✅ SBC System ready in demo mode!');
-    }
-}
-
-// API Routes
-app.get('/api/health', async (req, res) => {
-    try {
-        const healthData = { 
-            status: 'ok', 
-            initialized: isInitialized,
-            timestamp: new Date().toISOString(),
-            database: process.env.DATABASE_URL ? 'configured' : 'not configured',
-            playerCount: isInitialized ? sbcSolver.dataSource.playersMap.size : 0,
-            uptime: process.uptime(),
-            memory: process.memoryUsage(),
-            environment: process.env.NODE_ENV || 'development'
-        };
-        
-        console.log('🏥 Health check requested:', healthData);
-        res.status(200).json(healthData);
-        
-    } catch (error) {
-        console.error('❌ Health check error:', error);
-        res.status(500).json({
-            status: 'error',
-            initialized: false,
-            error: error.message,
-            timestamp: new Date().toISOString()
-        });
-    }
+// Simple request logger
+app.use((req, _res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
 });
 
-// Get all SBC solutions with real data
-app.get('/api/sbc/solutions', async (req, res) => {
+// ---------- Optional PostgreSQL ----------
+let pool = null;
+(async () => {
+  if (DATABASE_URL) {
     try {
-        if (!isInitialized) {
-            console.log('⚠️ API called but system not initialized');
-            return res.status(503).json({ 
-                error: 'System initializing, please wait...',
-                retry_after: 30,
-                initialized: false
-            });
-        }
-        
-        console.log('📊 Generating SBC solutions with real FUT.GG data...');
-        
-        // Return simple demo data if no database or initialization failed
-        if (!process.env.DATABASE_URL || !sbcSolver.dataSource) {
-            console.log('📊 Returning demo SBC solutions...');
-            return res.json([
-                {
-                    sbcName: 'Icon Moments Ronaldinho',
-                    isMultiSegment: true,
-                    totalCost: 450000,
-                    segments: new Map([
-                        ['Born Legend', {
-                            segmentName: 'Born Legend',
-                            totalCost: 25000,
-                            cheapestPlayers: [
-                                { name: 'Matheus Nunes', rating: 83, position: 'CM', price: 2800 },
-                                { name: 'Timber', rating: 83, position: 'CB', price: 2600 },
-                                { name: 'Soucek', rating: 83, position: 'CDM', price: 2200 }
-                            ],
-                            requirements: ['Min Rating: 83', 'Demo Mode'],
-                            reward: 'Small Rare Gold Pack'
-                        }],
-                        ['Rising Talent', {
-                            segmentName: 'Rising Talent', 
-                            totalCost: 85000,
-                            cheapestPlayers: [
-                                { name: 'Alisson', rating: 89, position: 'GK', price: 15000 },
-                                { name: 'Van Dijk', rating: 90, position: 'CB', price: 25000 },
-                                { name: 'Salah', rating: 89, position: 'RW', price: 35000 }
-                            ],
-                            requirements: ['Min Team Rating: 84', 'Demo Mode'],
-                            reward: 'Prime Mixed Players Pack'
-                        }]
-                    ]),
-                    completionReward: 'Icon Moments Ronaldinho (94 OVR)',
-                    expiry: '14 days',
-                    lastUpdated: new Date()
-                },
-                {
-                    sbcName: 'First XI Demo',
-                    isMultiSegment: false,
-                    totalCost: 45000,
-                    solution: {
-                        totalCost: 45000,
-                        chemistry: 100,
-                        rating: 82,
-                        squad: [
-                            { name: 'Courtois', rating: 89, position: 'GK', price: 12000 },
-                            { name: 'Benzema', rating: 87, position: 'ST', price: 18000 },
-                            { name: 'Modric', rating: 88, position: 'CM', price: 15000 }
-                        ]
-                    },
-                    requirements: ['Min Team Rating: 82', 'Demo Mode'],
-                    lastUpdated: new Date()
-                }
-            ]);
-        }
-        
-        // Define realistic SBC segments with requirements
-        const sbcSegments = [
-            {
-                sbcName: 'Icon Moments Ronaldinho',
-                segments: [
-                    {
-                        name: 'Born Legend',
-                        requirements: {
-                            minRating: 83,
-                            playersNeeded: 11,
-                            maxPrice: 5000, // Max 5k per player
-                            priority: 'medium'
-                        }
-                    },
-                    {
-                        name: 'Rising Talent',
-                        requirements: {
-                            minRating: 84,
-                            playersNeeded: 11,
-                            maxPrice: 15000,
-                            priority: 'high' // Get fresh prices
-                        }
-                    },
-                    {
-                        name: 'Top Form',
-                        requirements: {
-                            minRating: 86,
-                            playersNeeded: 11,
-                            versions: ['Team of the Week', 'In Form'], // IF players only
-                            priority: 'high'
-                        }
-                    }
-                ]
-            },
-            {
-                sbcName: 'POTM Bruno Fernandes',
-                segments: [
-                    {
-                        name: 'Liga Portugal',
-                        requirements: {
-                            minRating: 83,
-                            playersNeeded: 11,
-                            leagues: ['Liga Portugal'],
-                            maxPrice: 8000,
-                            priority: 'medium'
-                        }
-                    },
-                    {
-                        name: 'Premier League',
-                        requirements: {
-                            minRating: 85,
-                            playersNeeded: 11,
-                            leagues: ['Premier League'],
-                            maxPrice: 12000,
-                            priority: 'high'
-                        }
-                    }
-                ]
-            },
-            {
-                sbcName: 'First XI',
-                segments: [
-                    {
-                        name: 'Single Squad',
-                        requirements: {
-                            minRating: 82,
-                            playersNeeded: 11,
-                            maxPrice: 8000,
-                            priority: 'medium'
-                        }
-                    }
-                ]
-            }
-        ];
-
-        const solutions = [];
-
-        // Solve each live SBC
-        for (const sbc of activeSBCs) {
-            const sbcSolution = {
-                sbcName: sbc.sbcName,
-                isMultiSegment: sbc.segments.length > 1,
-                totalCost: 0,
-                segments: new Map(),
-                lastUpdated: new Date()
-            };
-
-            // Solve each segment
-            for (const segment of sbc.segments) {
-                try {
-                    const segmentSolution = await sbcSolver.solveSBCSegment(segment.name, segment.requirements);
-                    
-                    sbcSolution.segments.set(segment.name, {
-                        segmentName: segment.name,
-                        totalCost: segmentSolution.totalCost,
-                        cheapestPlayers: segmentSolution.cheapestPlayers,
-                        requirements: segmentSolution.requirements,
-                        reward: segment.reward || 'Premium Pack'
-                    });
-                    
-                    sbcSolution.totalCost += segmentSolution.totalCost;
-                    
-                } catch (segmentError) {
-                    console.error(`Error solving segment ${segment.name}:`, segmentError);
-                    
-                    // Add fallback segment with error
-                    sbcSolution.segments.set(segment.name, {
-                        segmentName: segment.name,
-                        totalCost: 0,
-                        cheapestPlayers: [],
-                        requirements: ['Error loading segment'],
-                        error: 'Could not solve segment'
-                    });
-                }
-            }
-
-            solutions.push(sbcSolution);
-        }
-        
-        console.log(`✅ Generated ${solutions.length} SBC solutions`);
-        res.json(solutions);
-        
-    } catch (error) {
-        console.error('Error generating SBC solutions:', error);
-        res.status(500).json({ 
-            error: 'Failed to generate solutions',
-            message: error.message
-        });
-    }
-});
-
-// Get specific SBC solution
-app.get('/api/sbc/solution/:name', async (req, res) => {
-    try {
-        if (!isInitialized) {
-            return res.status(503).json({ error: 'System initializing, please wait...' });
-        }
-        
-        const sbcName = decodeURIComponent(req.params.name);
-        console.log(`🎯 Solving specific SBC: ${sbcName}`);
-        
-        // This would be expanded based on the specific SBC
-        const solution = await sbcSolver.solveSBCSegment(sbcName, {
-            minRating: 82,
-            playersNeeded: 11,
-            maxPrice: 10000,
-            priority: 'high'
-        });
-        
-        if (!solution || solution.cheapestPlayers.length === 0) {
-            return res.status(404).json({ error: 'SBC solution not found' });
-        }
-        
-        res.json({
-            sbcName,
-            solution,
-            lastUpdated: new Date()
-        });
-        
-    } catch (error) {
-        console.error('Error fetching specific solution:', error);
-        res.status(500).json({ error: 'Failed to fetch solution' });
-    }
-});
-
-// Update prices manually
-app.post('/api/sbc/update-prices', async (req, res) => {
-    try {
-        if (!isInitialized) {
-            return res.status(503).json({ error: 'System initializing, please wait...' });
-        }
-        
-        console.log('🔄 Manual price update requested');
-        
-        // Get player IDs that need price updates (high-priority for SBCs)
-        const highPriorityPlayers = await getHighPriorityPlayers();
-        
-        if (highPriorityPlayers.length > 0) {
-            const updated = await sbcSolver.dataSource.updatePricesForPlayers(highPriorityPlayers, 10);
-            
-            res.json({ 
-                message: 'Prices updated successfully',
-                updated: updated.size,
-                timestamp: new Date().toISOString()
-            });
-        } else {
-            res.json({ 
-                message: 'No players needed price updates',
-                updated: 0,
-                timestamp: new Date().toISOString()
-            });
-        }
-        
-    } catch (error) {
-        console.error('Error updating prices:', error);
-        res.status(500).json({ error: 'Failed to update prices' });
-    }
-});
-
-// Get high-priority players for price updates
-async function getHighPriorityPlayers() {
-    try {
-        // Get players commonly used in SBCs (ratings 82+, reasonable prices)
-        const highPriorityPlayers = sbcSolver.dataSource.findPlayersByCriteria({
-            minRating: 82,
-            maxRating: 89,
-            maxPrice: 50000 // Under 50k coins
-        });
-        
-        // Return top 100 most relevant players
-        return highPriorityPlayers.slice(0, 100).map(p => p.id);
-        
-    } catch (error) {
-        console.error('Error getting high priority players:', error);
-        return [];
-    }
-}
-
-// Get live SBCs from scraper
-app.get('/api/sbc/live', async (req, res) => {
-    try {
-        console.log('🔍 Fetching live SBCs...');
-        
-        const liveSBCs = await liveSBCScraper.getActiveSBCs();
-        
-        res.json({
-            count: liveSBCs.length,
-            sbcs: liveSBCs,
-            lastUpdated: new Date().toISOString(),
-            sources: ['FUTBIN', 'FUT.GG']
-        });
-        
-    } catch (error) {
-        console.error('Error fetching live SBCs:', error);
-        res.status(500).json({ 
-            error: 'Failed to fetch live SBCs',
-            message: error.message 
-        });
-    }
-});
-
-// Refresh live SBC cache
-app.post('/api/sbc/refresh', async (req, res) => {
-    try {
-        console.log('🔄 Refreshing live SBC cache...');
-        
-        // Clear cache and fetch fresh data
-        liveSBCScraper.sbcCache.clear();
-        const freshSBCs = await liveSBCScraper.getActiveSBCs();
-        
-        res.json({
-            message: 'SBC cache refreshed successfully',
-            count: freshSBCs.length,
-            timestamp: new Date().toISOString()
-        });
-        
-    } catch (error) {
-        console.error('Error refreshing SBC cache:', error);
-        res.status(500).json({ error: 'Failed to refresh SBC cache' });
-    }
-});
-
-// Search SBCs
-app.get('/api/sbc/search', async (req, res) => {
-    try {
-        const { query } = req.query;
-        if (!query) {
-            return res.status(400).json({ error: 'Search query required' });
-        }
-        
-        // For now, return filtered mock results
-        // This could be expanded to search your actual SBC database
-        const mockSBCs = ['Icon Moments Ronaldinho', 'POTM Bruno Fernandes', 'First XI'];
-        const filtered = mockSBCs.filter(sbc => 
-            sbc.toLowerCase().includes(query.toLowerCase())
+      pool = new Pool({ connectionString: DATABASE_URL, max: 4, ssl: NODE_ENV === "production" ? { rejectUnauthorized: false } : false });
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS sbc_solves (
+          id SERIAL PRIMARY KEY,
+          created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+          metadata JSONB,
+          solution JSONB
         );
-        
-        res.json(filtered.map(name => ({ sbcName: name })));
-        
-    } catch (error) {
-        console.error('Error searching SBCs:', error);
-        res.status(500).json({ error: 'Search failed' });
+      `);
+      console.log("✅ PostgreSQL connected and table ensured.");
+    } catch (err) {
+      console.error("⚠️ PostgreSQL init failed:", err.message);
+      pool = null;
     }
-});
+  } else {
+    console.warn("ℹ️ DATABASE_URL not provided. Skipping PostgreSQL.");
+  }
+})();
 
-// Get player database stats
-app.get('/api/players/stats', async (req, res) => {
-    try {
-        if (!isInitialized) {
-            return res.status(503).json({ error: 'System initializing, please wait...' });
-        }
-        
-        const totalPlayers = sbcSolver.dataSource.playersMap.size;
-        const playersWithPrices = Array.from(sbcSolver.dataSource.playersMap.values())
-            .filter(p => p.price > 0).length;
-        
-        res.json({
-            totalPlayers,
-            playersWithPrices,
-            lastUpdated: new Date().toISOString(),
-            database: 'PostgreSQL + FUT.GG'
-        });
-        
-    } catch (error) {
-        console.error('Error fetching player stats:', error);
-        res.status(500).json({ error: 'Failed to fetch stats' });
-    }
-});
-
-// Serve the dashboard
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public/index.html'));
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-    console.error('Unhandled error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-});
-
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({ error: 'Route not found' });
-});
-
-// Scheduled tasks for production
-if (process.env.NODE_ENV === 'production') {
-    // Update prices every 2 hours for high-priority players
-    cron.schedule('0 */2 * * *', async () => {
-        if (isInitialized) {
-            console.log('🔄 Scheduled price update starting...');
-            try {
-                const highPriorityPlayers = await getHighPriorityPlayers();
-                
-                if (highPriorityPlayers.length > 0) {
-                    const updated = await sbcSolver.dataSource.updatePricesForPlayers(
-                        highPriorityPlayers.slice(0, 50), // Limit to 50 players per scheduled update
-                        5 // 5 concurrent requests
-                    );
-                    console.log(`✅ Scheduled price update completed: ${updated.size} prices updated`);
-                } else {
-                    console.log('⚠️ No high-priority players found for scheduled update');
-                }
-            } catch (error) {
-                console.error('❌ Scheduled price update failed:', error);
-            }
-        }
-    });
-    
-    // Health check every 15 minutes
-    cron.schedule('*/15 * * * *', async () => {
-        if (!isInitialized) {
-            console.log('🔄 Attempting to reinitialize system...');
-            await initializeSystem();
-        }
-    });
+// ---------- In-memory cache helper ----------
+const memCache = new Map(); // key -> { expiresAt, data }
+function setCache(key, data, ttlMs = 60_000) {
+  memCache.set(key, { expiresAt: Date.now() + ttlMs, data });
+}
+function getCache(key) {
+  const hit = memCache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    memCache.delete(key);
+    return null;
+  }
+  return hit.data;
 }
 
-// Start server
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🌐 Server running on port ${PORT}`);
-    console.log(`📊 Dashboard: http://localhost:${PORT}`);
-    console.log(`🔗 API: http://localhost:${PORT}/api`);
-    console.log(`💾 Database: ${process.env.DATABASE_URL ? 'Connected' : 'Not configured'}`);
-    
-    // Initialize system after server starts
-    initializeSystem();
-});
+// ---------- Utilities ----------
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n));
+}
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-    console.log('👋 Server shutting down gracefully...');
-    
-    if (isInitialized) {
-        await sbcSolver.close();
+function countByProp(list, prop) {
+  return list.reduce((acc, item) => {
+    const k = item?.[prop] ?? "UNKNOWN";
+    acc[k] = (acc[k] || 0) + 1;
+    return acc;
+  }, {});
+}
+
+function estimateChemistry(players = []) {
+  // Very rough stand-in: +1 per shared club link, +0.5 per league, +0.25 per nation overlap, capped at 33
+  let chem = 0;
+  const byClub = countByProp(players, "club");
+  const byLeague = countByProp(players, "league");
+  const byNation = countByProp(players, "nation");
+
+  chem += Object.values(byClub).reduce((s, n) => s + Math.max(0, n - 1), 0) * 1.0;
+  chem += Object.values(byLeague).reduce((s, n) => s + Math.max(0, n - 1), 0) * 0.5;
+  chem += Object.values(byNation).reduce((s, n) => s + Math.max(0, n - 1), 0) * 0.25;
+
+  return clamp(Math.round(chem), 0, 33);
+}
+
+function summarizeSquad(squad) {
+  const cost = _.sumBy(squad, (p) => p.price || 0);
+  const avgRating = squad.length ? _.round(_.meanBy(squad, "rating"), 2) : 0;
+  return {
+    cost,
+    avgRating,
+    nationCounts: countByProp(squad, "nation"),
+    leagueCounts: countByProp(squad, "league"),
+    clubCounts: countByProp(squad, "club"),
+    chemEstimate: estimateChemistry(squad),
+  };
+}
+
+// Returns true if candidate fits basic requirement filters
+function candidatePassesBasic(req, player) {
+  if (!player) return false;
+
+  if (req.minOverall && player.rating < req.minOverall) return false;
+  if (req.maxOverall && player.rating > req.maxOverall) return false;
+
+  if (req.minRare && req.minRare > 0) {
+    const isRare = !!player.rare;
+    if (!isRare) return false;
+  }
+
+  return true;
+}
+
+// Attempts to assign 11 players to the given positions
+function assignPlayersToPositions(req, candidates, options) {
+  const positions = req.positions && req.positions.length ? req.positions : ["GK","RB","CB","CB","LB","CM","CM","CAM","RW","LW","ST"];
+  const allowDuplicates = !!req.allowDuplicates;
+
+  // Filter by basic (overall/rarity)
+  let pool = candidates.filter((p) => candidatePassesBasic(req, p));
+
+  // Objective sorting
+  const objective = options?.objective || "cheapest";
+  if (objective === "cheapest") {
+    pool = _.sortBy(pool, (p) => p.price || Number.MAX_SAFE_INTEGER);
+  } else if (objective === "highest") {
+    pool = _.orderBy(pool, ["rating", (p) => -(p.price || 0)], ["desc", "asc"]);
+  } else {
+    // balanced: rating per price
+    pool = _.orderBy(
+      pool,
+      [(p) => (p.rating || 0) / (p.price || (p.rating ? 1000 : 1)), "rating"],
+      ["desc", "desc"]
+    );
+  }
+
+  // Track used ids to prevent duplicates
+  const used = new Set();
+  const squad = [];
+
+  for (const slot of positions) {
+    // Try strict match
+    let pick = pool.find((p) => !used.has(p.id) && p.position === slot);
+    // Try altPositions if allowed
+    if (!pick && options?.preferAltPositions) {
+      pick = pool.find((p) => !used.has(p.id) && Array.isArray(p.altPositions) && p.altPositions.includes(slot));
     }
-    
-    process.exit(0);
-});
-
-process.on('SIGINT', async () => {
-    console.log('👋 Server shutting down gracefully...');
-    
-    if (isInitialized) {
-        await sbcSolver.close();
+    // Fallback: any same category (e.g., RW ~ RM ~ RW/LW) – very loose
+    if (!pick) {
+      pick = pool.find((p) => !used.has(p.id) && (p.position?.includes("W") && slot.includes("W")));
     }
-    
-    process.exit(0);
+
+    if (pick) {
+      squad.push({ ...pick, assignedPosition: slot });
+      if (!allowDuplicates) used.add(pick.id);
+    } else {
+      // No candidate found for slot
+      return { ok: false, reason: `No candidate for position ${slot}`, squad };
+    }
+  }
+
+  return { ok: true, squad };
+}
+
+// Validates squad against counts (nation/league/club) and chemistry
+function validateSquad(req, squad) {
+  const summary = summarizeSquad(squad);
+
+  // Nation counts
+  if (req.minNationCount) {
+    for (const [nation, min] of Object.entries(req.minNationCount)) {
+      const have = summary.nationCounts[nation] || 0;
+      if (have < min) return { ok: false, reason: `Need ${min} ${nation} (have ${have})` };
+    }
+  }
+  // League counts
+  if (req.minLeagueCount) {
+    for (const [league, min] of Object.entries(req.minLeagueCount)) {
+      const have = summary.leagueCounts[league] || 0;
+      if (have < min) return { ok: false, reason: `Need ${min} from ${league} (have ${have})` };
+    }
+  }
+  // Club counts
+  if (req.minClubCount) {
+    for (const [club, min] of Object.entries(req.minClubCount)) {
+      const have = summary.clubCounts[club] || 0;
+      if (have < min) return { ok: false, reason: `Need ${min} from ${club} (have ${have})` };
+    }
+  }
+  // Chemistry estimate
+  if (req.minChemistry && summary.chemEstimate < req.minChemistry) {
+    return { ok: false, reason: `Chemistry too low: need ${req.minChemistry}, have ${summary.chemEstimate}` };
+  }
+
+  return { ok: true, summary };
+}
+
+// Attempts multiple tries to satisfy constraints by slightly reshuffling
+function tryBuildSquad(req, candidates, options) {
+  // quick fast-path
+  let attempt = assignPlayersToPositions(req, candidates, options);
+  if (!attempt.ok) return attempt;
+
+  let check = validateSquad(req, attempt.squad);
+  if (check.ok) return { ok: true, squad: attempt.squad, summary: check.summary };
+
+  // Limited reshuffles: swap 2-3 times
+  for (let i = 0; i < 8; i++) {
+    const shuffled = _.shuffle(candidates);
+    attempt = assignPlayersToPositions(req, shuffled, options);
+    if (!attempt.ok) continue;
+
+    check = validateSquad(req, attempt.squad);
+    if (check.ok) return { ok: true, squad: attempt.squad, summary: check.summary };
+  }
+
+  return { ok: false, reason: check.reason || "Unable to meet constraints after several attempts." };
+}
+
+// ---------- Routes ----------
+
+app.get("/api/health", (_req, res) => {
+  res.json({ ok: true, uptime: process.uptime(), env: NODE_ENV, db: !!pool });
 });
 
-module.exports = app;
+app.get("/api/ping", (_req, res) => res.send("pong"));
+
+app.post("/api/cache/clear", (req, res) => {
+  memCache.clear();
+  res.json({ ok: true, cleared: true });
+});
+
+/**
+ * Solve multi-segment SBC
+ * Body: { segments: [...], candidates: [...], options: {...} }
+ */
+app.post("/api/sbc/solve", async (req, res) => {
+  try {
+    const { segments, candidates, options } = req.body || {};
+
+    if (!Array.isArray(segments) || segments.length === 0) {
+      return res.status(400).json({ ok: false, error: "segments[] is required" });
+    }
+    if (!Array.isArray(candidates) || candidates.length === 0) {
+      return res.status(400).json({ ok: false, error: "candidates[] is required" });
+    }
+
+    const solutions = [];
+    let remaining = [...candidates];
+
+    for (const seg of segments) {
+      const name = seg?.name || `Segment ${solutions.length + 1}`;
+      const requirements = seg?.requirements || {};
+
+      const result = tryBuildSquad(requirements, remaining, options);
+      if (!result.ok) {
+        solutions.push({ segment: name, status: "fail", reason: result.reason, squad: result.squad || [] });
+        // Optional: stop on first failure
+        // break;
+        continue;
+      }
+
+      const squad = result.squad;
+      const summary = result.summary || summarizeSquad(squad);
+      solutions.push({ segment: name, status: "ok", squad, summary });
+
+      // Remove chosen players if duplicates not allowed across segments
+      if (!requirements.allowDuplicates) {
+        const chosenIds = new Set(squad.map((p) => p.id));
+        remaining = remaining.filter((p) => !chosenIds.has(p.id));
+      }
+    }
+
+    // Optionally persist
+    if (pool) {
+      try {
+        await pool.query(
+          `INSERT INTO sbc_solves(metadata, solution) VALUES ($1, $2)`,
+          [{ options, segmentsCount: segments.length }, { solutions }]
+        );
+      } catch (e) {
+        console.warn("⚠️ Failed to persist solve:", e.message);
+      }
+    }
+
+    res.json({ ok: true, solutions });
+  } catch (err) {
+    console.error("Solve error:", err);
+    res.status(500).json({ ok: false, error: "Internal error", detail: err?.message });
+  }
+});
+
+/**
+ * Fetch last N stored solves (diagnostics)
+ * GET /api/sbc/solves?limit=10
+ */
+app.get("/api/sbc/solves", async (req, res) => {
+  if (!pool) return res.status(503).json({ ok: false, error: "DB not configured" });
+  const limit = clamp(parseInt(req.query.limit || "10", 10) || 10, 1, 100);
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, created_at, metadata, solution FROM sbc_solves ORDER BY id DESC LIMIT $1`,
+      [limit]
+    );
+    res.json({ ok: true, rows });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---------- Cron: prune old rows (every night at 03:30) ----------
+if (pool) {
+  cron.schedule("30 3 * * *", async () => {
+    try {
+      const { rowCount } = await pool.query(`DELETE FROM sbc_solves WHERE created_at < NOW() - INTERVAL '14 days'`);
+      if (rowCount) console.log(`🧹 Pruned ${rowCount} old sbc_solves rows.`);
+    } catch (e) {
+      console.warn("Cron prune failed:", e.message);
+    }
+  });
+}
+
+// ---------- Start ----------
+app.listen(PORT, HOST, () => {
+  console.log(`✅ FC25 SBC Solver API listening on http://${HOST}:${PORT} [${NODE_ENV}]`);
+});
