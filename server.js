@@ -4,8 +4,9 @@ const cors = require('cors');
 const path = require('path');
 const cron = require('node-cron');
 
-// Import Postgres-based SBC solver instead of mock data
+// Import Postgres-based SBC solver and live SBC scraper
 const { PostgresSBCSolver } = require('./src/postgres-futgg-integration');
+const LiveSBCScraper = require('./src/live-sbc-scraper');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,8 +16,9 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static('public'));
 
-// Initialize SBC systems with Postgres
+// Initialize SBC systems with Postgres and live scraper
 const sbcSolver = new PostgresSBCSolver();
+const liveSBCScraper = new LiveSBCScraper();
 let isInitialized = false;
 
 // Initialize on startup
@@ -24,14 +26,27 @@ async function initializeSystem() {
     if (isInitialized) return;
     
     try {
-        console.log('🚀 Initializing SBC System with Postgres + FUT.GG...');
+        console.log('🚀 Initializing SBC System...');
+        
+        // Check if database is configured
+        if (!process.env.DATABASE_URL) {
+            console.log('⚠️ No DATABASE_URL found, running in demo mode');
+            isInitialized = true;
+            return;
+        }
+        
+        console.log('💾 Database URL found, connecting to Postgres...');
         await sbcSolver.initialize();
         console.log('✅ SBC System ready with real data!');
         isInitialized = true;
         
     } catch (error) {
-        console.error('❌ Initialization failed:', error);
-        console.log('🔄 System will retry initialization on next request');
+        console.error('❌ Database initialization failed:', error.message);
+        console.log('🔄 Falling back to demo mode...');
+        
+        // Initialize in demo mode
+        isInitialized = true;
+        console.log('✅ SBC System ready in demo mode!');
     }
 }
 
@@ -77,20 +92,57 @@ app.get('/api/sbc/solutions', async (req, res) => {
         
         console.log('📊 Generating SBC solutions with real FUT.GG data...');
         
-        // Return simple mock data if database connection fails
-        if (!process.env.DATABASE_URL) {
-            console.log('⚠️ No database configured, returning simple mock data');
+        // Return simple demo data if no database or initialization failed
+        if (!process.env.DATABASE_URL || !sbcSolver.dataSource) {
+            console.log('📊 Returning demo SBC solutions...');
             return res.json([
                 {
-                    sbcName: 'Demo SBC',
+                    sbcName: 'Icon Moments Ronaldinho',
+                    isMultiSegment: true,
+                    totalCost: 450000,
+                    segments: new Map([
+                        ['Born Legend', {
+                            segmentName: 'Born Legend',
+                            totalCost: 25000,
+                            cheapestPlayers: [
+                                { name: 'Matheus Nunes', rating: 83, position: 'CM', price: 2800 },
+                                { name: 'Timber', rating: 83, position: 'CB', price: 2600 },
+                                { name: 'Soucek', rating: 83, position: 'CDM', price: 2200 }
+                            ],
+                            requirements: ['Min Rating: 83', 'Demo Mode'],
+                            reward: 'Small Rare Gold Pack'
+                        }],
+                        ['Rising Talent', {
+                            segmentName: 'Rising Talent', 
+                            totalCost: 85000,
+                            cheapestPlayers: [
+                                { name: 'Alisson', rating: 89, position: 'GK', price: 15000 },
+                                { name: 'Van Dijk', rating: 90, position: 'CB', price: 25000 },
+                                { name: 'Salah', rating: 89, position: 'RW', price: 35000 }
+                            ],
+                            requirements: ['Min Team Rating: 84', 'Demo Mode'],
+                            reward: 'Prime Mixed Players Pack'
+                        }]
+                    ]),
+                    completionReward: 'Icon Moments Ronaldinho (94 OVR)',
+                    expiry: '14 days',
+                    lastUpdated: new Date()
+                },
+                {
+                    sbcName: 'First XI Demo',
                     isMultiSegment: false,
-                    totalCost: 25000,
+                    totalCost: 45000,
                     solution: {
-                        totalCost: 25000,
-                        rating: 84,
+                        totalCost: 45000,
                         chemistry: 100,
-                        squad: []
+                        rating: 82,
+                        squad: [
+                            { name: 'Courtois', rating: 89, position: 'GK', price: 12000 },
+                            { name: 'Benzema', rating: 87, position: 'ST', price: 18000 },
+                            { name: 'Modric', rating: 88, position: 'CM', price: 15000 }
+                        ]
                     },
+                    requirements: ['Min Team Rating: 82', 'Demo Mode'],
                     lastUpdated: new Date()
                 }
             ]);
@@ -173,8 +225,8 @@ app.get('/api/sbc/solutions', async (req, res) => {
 
         const solutions = [];
 
-        // Solve each SBC
-        for (const sbc of sbcSegments) {
+        // Solve each live SBC
+        for (const sbc of activeSBCs) {
             const sbcSolution = {
                 sbcName: sbc.sbcName,
                 isMultiSegment: sbc.segments.length > 1,
@@ -313,6 +365,50 @@ async function getHighPriorityPlayers() {
         return [];
     }
 }
+
+// Get live SBCs from scraper
+app.get('/api/sbc/live', async (req, res) => {
+    try {
+        console.log('🔍 Fetching live SBCs...');
+        
+        const liveSBCs = await liveSBCScraper.getActiveSBCs();
+        
+        res.json({
+            count: liveSBCs.length,
+            sbcs: liveSBCs,
+            lastUpdated: new Date().toISOString(),
+            sources: ['FUTBIN', 'FUT.GG']
+        });
+        
+    } catch (error) {
+        console.error('Error fetching live SBCs:', error);
+        res.status(500).json({ 
+            error: 'Failed to fetch live SBCs',
+            message: error.message 
+        });
+    }
+});
+
+// Refresh live SBC cache
+app.post('/api/sbc/refresh', async (req, res) => {
+    try {
+        console.log('🔄 Refreshing live SBC cache...');
+        
+        // Clear cache and fetch fresh data
+        liveSBCScraper.sbcCache.clear();
+        const freshSBCs = await liveSBCScraper.getActiveSBCs();
+        
+        res.json({
+            message: 'SBC cache refreshed successfully',
+            count: freshSBCs.length,
+            timestamp: new Date().toISOString()
+        });
+        
+    } catch (error) {
+        console.error('Error refreshing SBC cache:', error);
+        res.status(500).json({ error: 'Failed to refresh SBC cache' });
+    }
+});
 
 // Search SBCs
 app.get('/api/sbc/search', async (req, res) => {
