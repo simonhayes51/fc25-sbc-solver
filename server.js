@@ -36,26 +36,65 @@ async function initializeSystem() {
 }
 
 // API Routes
-app.get('/api/health', (req, res) => {
-    res.json({ 
-        status: 'ok', 
-        initialized: isInitialized,
-        timestamp: new Date().toISOString(),
-        database: process.env.DATABASE_URL ? 'connected' : 'not configured'
-    });
+app.get('/api/health', async (req, res) => {
+    try {
+        const healthData = { 
+            status: 'ok', 
+            initialized: isInitialized,
+            timestamp: new Date().toISOString(),
+            database: process.env.DATABASE_URL ? 'configured' : 'not configured',
+            playerCount: isInitialized ? sbcSolver.dataSource.playersMap.size : 0,
+            uptime: process.uptime(),
+            memory: process.memoryUsage(),
+            environment: process.env.NODE_ENV || 'development'
+        };
+        
+        console.log('🏥 Health check requested:', healthData);
+        res.status(200).json(healthData);
+        
+    } catch (error) {
+        console.error('❌ Health check error:', error);
+        res.status(500).json({
+            status: 'error',
+            initialized: false,
+            error: error.message,
+            timestamp: new Date().toISOString()
+        });
+    }
 });
 
 // Get all SBC solutions with real data
 app.get('/api/sbc/solutions', async (req, res) => {
     try {
         if (!isInitialized) {
+            console.log('⚠️ API called but system not initialized');
             return res.status(503).json({ 
                 error: 'System initializing, please wait...',
-                retry_after: 30 
+                retry_after: 30,
+                initialized: false
             });
         }
         
         console.log('📊 Generating SBC solutions with real FUT.GG data...');
+        
+        // Return simple mock data if database connection fails
+        if (!process.env.DATABASE_URL) {
+            console.log('⚠️ No database configured, returning simple mock data');
+            return res.json([
+                {
+                    sbcName: 'Demo SBC',
+                    isMultiSegment: false,
+                    totalCost: 25000,
+                    solution: {
+                        totalCost: 25000,
+                        rating: 84,
+                        chemistry: 100,
+                        squad: []
+                    },
+                    lastUpdated: new Date()
+                }
+            ]);
+        }
         
         // Define realistic SBC segments with requirements
         const sbcSegments = [
