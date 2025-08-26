@@ -22,19 +22,34 @@ class PostgresFUTGGDataSource {
         console.log('🔄 Loading players from Postgres database...');
         
         try {
+            // First, let's check what columns actually exist in fut_players table
+            const columnQuery = `
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'fut_players'
+                ORDER BY ordinal_position;
+            `;
+            
+            const columnResult = await this.dbPool.query(columnQuery);
+            const availableColumns = columnResult.rows.map(row => row.column_name);
+            console.log('📋 Available columns in fut_players:', availableColumns);
+            
+            // Query the correct table with all your columns
             const query = `
                 SELECT 
                     id, name, rating, version, image_url, created_at, 
                     player_slug, player_url, card_id, price, club, nation, position
-                FROM players 
+                FROM fut_players 
                 WHERE card_id IS NOT NULL 
                 ORDER BY rating DESC, name ASC
             `;
             
+            console.log('🔍 Querying fut_players table...');
+            
             const result = await this.dbPool.query(query);
             const players = result.rows;
             
-            console.log(`📊 Found ${players.length} players in database`);
+            console.log(`📊 Found ${players.length} players in fut_players table`);
             
             // Convert to our format and store
             for (const player of players) {
@@ -53,7 +68,7 @@ class PostgresFUTGGDataSource {
                     price: parseInt(player.price) || 0,
                     lastPriceUpdate: player.created_at,
                     rarity: this.getRarityFromVersion(player.version),
-                    league: this.getLeagueFromClub(player.club), // You might want to add league to DB
+                    league: this.getLeagueFromClub(player.club),
                     alternativePositions: this.getAltPositions(player.position)
                 });
             }
@@ -62,7 +77,7 @@ class PostgresFUTGGDataSource {
             return this.playersMap;
             
         } catch (error) {
-            console.error('❌ Error loading players from database:', error);
+            console.error('❌ Error loading players from fut_players table:', error);
             throw error;
         }
     }
