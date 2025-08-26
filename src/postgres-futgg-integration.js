@@ -130,8 +130,13 @@ class PostgresFUTGGDataSource {
 
     // Extract price from FUT.GG API response
     extractPriceFromResponse(data) {
-        // Adjust this based on actual FUT.GG API response structure
-        // Common patterns:
+        console.log('🔍 FUT.GG API response:', data);
+        
+        // FUT.GG returns buy/sell prices - we want the buy price (what you pay)
+        if (data.buy) return parseInt(data.buy);
+        if (data.buyPrice) return parseInt(data.buyPrice);
+        
+        // Fallback patterns
         if (data.price) return parseInt(data.price);
         if (data.current_price) return parseInt(data.current_price);
         if (data.lowest_price) return parseInt(data.lowest_price);
@@ -140,10 +145,10 @@ class PostgresFUTGGDataSource {
         // If it's an array, take the first/latest price
         if (Array.isArray(data) && data.length > 0) {
             const latest = data[0];
-            return parseInt(latest.price || latest.value || 0);
+            return parseInt(latest.buy || latest.buyPrice || latest.price || latest.value || 0);
         }
         
-        console.log(`⚠️ Unexpected API response format:`, data);
+        console.log(`⚠️ Could not extract price from response:`, data);
         return 0;
     }
 
@@ -286,7 +291,7 @@ class PostgresFUTGGDataSource {
             
             for (const [cardId, price] of priceUpdates) {
                 await client.query(
-                    'UPDATE players SET price = $1, updated_at = NOW() WHERE card_id = $2',
+                    'UPDATE fut_players SET price = $1, updated_at = NOW() WHERE card_id = $2',
                     [price, cardId]
                 );
             }
@@ -452,25 +457,3 @@ module.exports = {
     PostgresFUTGGDataSource,
     PostgresSBCSolver
 };
-
-// Example usage:
-/*
-const solver = new PostgresSBCSolver();
-
-// Initialize with your database
-await solver.initialize();
-
-// Solve a segment
-const solution = await solver.solveSBCSegment('Rising Talent', {
-    minRating: 84,
-    maxPrice: 5000,
-    positions: ['ST', 'CF'],
-    playersNeeded: 11,
-    priority: 'high' // Will fetch fresh prices
-});
-
-console.log(`Solution: ${solution.totalCost} coins`);
-solution.cheapestPlayers.forEach(player => {
-    console.log(`${player.name} (${player.rating}) - ${player.price} coins`);
-});
-*/
