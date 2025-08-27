@@ -23,7 +23,14 @@ process.on('uncaughtException', (err) => {
 // --- Boot flags / late-bound deps ---
 let isInitialized = false;
 let sbcSolver = null;
-let liveSBCScraper = null;
+let LiveSBCScraper;
+try {
+  LiveSBCScraper = require('./src/live-sbc-scraper');
+} catch (e) {
+  console.error('Failed to load live-sbc-scraper:', e.message);
+  LiveSBCScraper = class { async getActiveSBCs(){ return []; } };
+}
+const scraper = new LiveSBCScraper();
 
 // --- Liveness first: MUST be cheap and always 200 ---
 app.get('/api/health', (req, res) => {
