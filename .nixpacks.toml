@@ -1,13 +1,15 @@
 # .nixpacks.toml
-[node]
-version = "22"
+[variables]
+NODE_ENV = "production"
+
+[phases.setup]
+nixPkgs = ["nodejs_18", "npm-9_x"]
 
 [phases.install]
 cmds = [
-  "npm config set prefer-online true",
-  "npm config set cache /tmp/.npm --location=global",
-  "npm cache clean --force || true",
-  "npm install --omit=dev --no-audit --no-fund"
+  "npm config set fund false",
+  "npm config set audit false", 
+  "npm ci --only=production --no-optional"
 ]
 
 [phases.build]
@@ -15,3 +17,6 @@ cmds = []
 
 [start]
 cmd = "node server.js"
+
+[staticAssets]
+"public" = "/"
