@@ -1,13 +1,11 @@
 # Dockerfile
-FROM node:22-slim
+FROM node:22-bullseye
 
 ENV NODE_ENV=production \
     NPM_CONFIG_CACHE=/root/.npm \
     NPM_CONFIG_PREFER_ONLINE=true \
-    NPM_CONFIG_FOREGROUND_SCRIPTS=false \
     NPM_CONFIG_AUDIT=false \
     NPM_CONFIG_FUND=false \
-    NPM_CONFIG_STRICT_SSL=true \
     NPM_CONFIG_FETCH_RETRIES=5 \
     NPM_CONFIG_FETCH_RETRY_FACTOR=2 \
     NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=2000 \
@@ -16,8 +14,9 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-# Install only prod deps first (better layer caching)
+# Install only production deps first (better layer caching)
 COPY package*.json ./
+# nuke any stale cache and install prod deps (no devs like nodemon)
 RUN npm cache clean --force || true \
  && rm -rf /root/.npm/_cacache || true \
  && npm config set registry https://registry.npmjs.org/ \
