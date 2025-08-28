@@ -1,0 +1,12 @@
+# .nixpacks.toml
+[node]
+version = "22"
+
+[phases.install]
+cmds = ["npm ci --omit=dev"]
+
+[phases.build]
+cmds = []  # Express API, no build step
+
+[start]
+cmd = "node server.js"
