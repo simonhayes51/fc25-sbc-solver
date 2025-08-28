@@ -8,22 +8,25 @@
     "dev": "nodemon server.js",
     "build": "echo \"No build step required\"",
     "test-scraper": "node scripts/test-scraper.js",
-    "test-scraper:expand": "node scripts/test-scraper.js expand 10"
+    "test": "echo \"No tests specified\" && exit 0"
   },
   "dependencies": {
-    "axios": "1.6.0",
-    "cheerio": "1.0.0-rc.12",
-    "cors": "2.8.5",
-    "express": "4.18.2",
-    "lodash": "4.17.21",
-    "node-cron": "3.0.3",
-    "pg": "8.11.3"
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "lodash": "^4.17.21"
   },
   "devDependencies": {
-    "nodemon": "3.0.1"
+    "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=18"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "keywords": ["fifa", "fc25", "sbc", "squad-building-challenge", "fut", "ultimate-team"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/fc25-sbc-solver.git"
+  }
 }
