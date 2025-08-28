@@ -1,4 +1,4 @@
-// server.js — Failsafe-first Express with deferred imports
+// server.js — FIXED Failsafe-first Express with working live SBC data
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -20,10 +20,26 @@ process.on('uncaughtException', (err) => {
   console.error('UNCAUGHT EXCEPTION:', err);
 });
 
-// --- Boot flags / late-bound deps ---
+// --- FIXED: Boot flags / late-bound deps ---
 let isInitialized = false;
 let sbcSolver = null;
-let liveSBCScraper = null;
+let liveSBCScraper = null; // FIXED: Consistent variable naming
+
+// FIXED: Proper scraper initialization
+try {
+  const LiveSBCScraperClass = require('./src/live-sbc-scraper');
+  liveSBCScraper = new LiveSBCScraperClass();
+  console.log('✅ LiveSBCScraper loaded successfully');
+} catch (e) {
+  console.error('❌ Failed to load live-sbc-scraper:', e.message);
+  console.error('📄 Full error details:', e);
+  liveSBCScraper = {
+    async getActiveSBCs() {
+      console.warn('⚠️ Using fallback SBC scraper - no real data available');
+      return [];
+    }
+  };
+}
 
 // --- Liveness first: MUST be cheap and always 200 ---
 app.get('/api/health', (req, res) => {
@@ -31,6 +47,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     initialized: Boolean(isInitialized),
     dbConfigured: Boolean(process.env.DATABASE_URL),
+    scraperLoaded: Boolean(liveSBCScraper?.getActiveSBCs),
     uptimeSec: Math.round(process.uptime()),
     rssMB: Math.round((process.memoryUsage().rss / 1024 / 1024) * 10) / 10,
     ts: new Date().toISOString(),
@@ -43,12 +60,15 @@ app.get('/health', (req, res) => res.redirect(307, '/api/health'));
 app.get('/api/ready', (req, res) => {
   const dbConfigured = !!process.env.DATABASE_URL;
   const dataSourceReady = !!(sbcSolver && sbcSolver.dataSource);
-  const ready = isInitialized && (!dbConfigured || dataSourceReady);
+  const scraperReady = !!(liveSBCScraper && liveSBCScraper.getActiveSBCs);
+  const ready = isInitialized && scraperReady && (!dbConfigured || dataSourceReady);
+  
   res.status(ready ? 200 : 503).json({
     status: ready ? 'ready' : 'not-ready',
     initialized: Boolean(isInitialized),
     dbConfigured,
     dataSourceReady,
+    scraperReady,
     ts: new Date().toISOString(),
   });
 });
@@ -59,12 +79,6 @@ async function initializeSystem() {
   try {
     console.log('🚀 Initializing system...');
 
-    // Defer heavy requires until after health routes are live
-    const { PostgresSBCSolver } = require('./src/postgres-futgg-integration');
-    const LiveSBCScraper = require('./src/live-sbc-scraper');
-
-    liveSBCScraper = new LiveSBCScraper();
-
     if (!process.env.DATABASE_URL) {
       console.log('⚠️ No DATABASE_URL; starting in demo mode.');
       isInitialized = true;
@@ -72,6 +86,10 @@ async function initializeSystem() {
     }
 
     console.log('💾 DATABASE_URL found; connecting to Postgres…');
+    
+    // Defer heavy requires until after health routes are live
+    const { PostgresSBCSolver } = require('./src/postgres-futgg-integration');
+    
     sbcSolver = new PostgresSBCSolver();
     await sbcSolver.initialize();
     console.log('✅ Data source ready.');
@@ -244,23 +262,201 @@ app.post('/api/sbc/update-prices', async (req, res) => {
   }
 });
 
-// Live SBCs
+// FIXED: Live SBCs endpoint
 app.get('/api/sbc/live', async (req, res) => {
   try {
+    console.log('🎯 Live SBC endpoint called');
+    
     if (!liveSBCScraper?.getActiveSBCs) {
-      // still safe: return empty list rather than error
-      return res.json({ count: 0, sbcs: [], lastUpdated: new Date().toISOString(), sources: ['FUT.GG'] });
+      console.warn('⚠️ LiveSBCScraper not available');
+      return res.json({ 
+        count: 0, 
+        sbcs: [], 
+        lastUpdated: new Date().toISOString(), 
+        sources: ['FUT.GG'],
+        error: 'SBC scraper not initialized'
+      });
     }
+    
+    console.log('🔄 Calling liveSBCScraper.getActiveSBCs()...');
     const live = await liveSBCScraper.getActiveSBCs();
+    console.log(`📊 Retrieved ${Array.isArray(live) ? live.length : 0} live SBCs`);
+    
     res.json({
       count: Array.isArray(live) ? live.length : 0,
       sbcs: live ?? [],
       lastUpdated: new Date().toISOString(),
-      sources: ['FUT.GG'],
+      sources: ['FUTBIN', 'FUT.GG'],
+      debug: {
+        scraperAvailable: Boolean(liveSBCScraper),
+        dataType: typeof live,
+        isArray: Array.isArray(live)
+      }
     });
   } catch (e) {
-    console.error('/api/sbc/live error:', e);
-    res.status(500).json({ error: 'Failed to fetch live SBCs', message: e.message });
+    console.error('❌ /api/sbc/live error:', e);
+    res.status(500).json({ 
+      error: 'Failed to fetch live SBCs', 
+      message: e.message,
+      stack: process.env.NODE_ENV === 'development' ? e.stack : undefined
+    });
+  }
+});
+
+// ENHANCED: Manual SBC refresh endpoint
+app.post('/api/sbc/refresh', async (req, res) => {
+  try {
+    console.log('🔄 Manual SBC refresh triggered...');
+    
+    if (!liveSBCScraper?.getActiveSBCs) {
+      return res.status(503).json({ 
+        error: 'SBC scraper not available',
+        suggestion: 'Check server logs for scraper initialization errors'
+      });
+    }
+    
+    // Force fresh data (bypass cache)
+    if (liveSBCScraper.sbcCache?.clear) {
+      liveSBCScraper.sbcCache.clear();
+      console.log('🗑️ Cache cleared');
+    }
+    
+    const startTime = Date.now();
+    const freshSBCs = await liveSBCScraper.getActiveSBCs();
+    const duration = Date.now() - startTime;
+    
+    console.log(`✅ Manual refresh completed: ${Array.isArray(freshSBCs) ? freshSBCs.length : 0} SBCs in ${duration}ms`);
+    
+    res.json({
+      success: true,
+      count: Array.isArray(freshSBCs) ? freshSBCs.length : 0,
+      sbcs: freshSBCs || [],
+      refreshDuration: duration,
+      timestamp: new Date(),
+      sources: ['FUTBIN', 'FUT.GG']
+    });
+    
+  } catch (error) {
+    console.error('❌ Manual SBC refresh failed:', error);
+    res.status(500).json({
+      error: 'Refresh failed',
+      message: error.message
+    });
+  }
+});
+
+// DEBUG: Test endpoint to debug the scraper directly
+app.get('/api/debug/sbc-test', async (req, res) => {
+  try {
+    console.log('🧪 Testing live SBC scraper directly...');
+    
+    const diagnosis = {
+      timestamp: new Date(),
+      scraperStatus: {
+        loaded: Boolean(liveSBCScraper),
+        hasMethod: Boolean(liveSBCScraper?.getActiveSBCs),
+        type: typeof liveSBCScraper
+      }
+    };
+    
+    // Test the scraper method
+    if (liveSBCScraper?.getActiveSBCs) {
+      try {
+        console.log('🔄 Testing getActiveSBCs()...');
+        const startTime = Date.now();
+        const result = await liveSBCScraper.getActiveSBCs();
+        const duration = Date.now() - startTime;
+        
+        diagnosis.testResult = {
+          success: true,
+          duration: duration,
+          resultType: typeof result,
+          isArray: Array.isArray(result),
+          count: Array.isArray(result) ? result.length : 0,
+          sampleData: Array.isArray(result) ? result.slice(0, 2) : result
+        };
+        
+        console.log(`✅ Scraper test successful: ${diagnosis.testResult.count} SBCs`);
+        
+      } catch (error) {
+        console.error('❌ Scraper test failed:', error);
+        diagnosis.testResult = {
+          success: false,
+          error: error.message,
+          stack: error.stack
+        };
+      }
+    } else {
+      diagnosis.testResult = {
+        success: false,
+        error: 'getActiveSBCs method not available'
+      };
+    }
+    
+    res.json(diagnosis);
+    
+  } catch (error) {
+    console.error('🚨 Debug test failed:', error);
+    res.status(500).json({
+      error: 'Debug test failed',
+      message: error.message
+    });
+  }
+});
+
+// DEBUG: Source connectivity test
+app.get('/api/debug/sources', async (req, res) => {
+  try {
+    const axios = require('axios');
+    
+    const sources = [
+      { name: 'FUTBIN_SBC', url: 'https://www.futbin.com/25/squad-building-challenges' },
+      { name: 'FUTGG_SBC', url: 'https://www.fut.gg/sbc/' },
+      { name: 'FUTBIN_MAIN', url: 'https://www.futbin.com/' }
+    ];
+    
+    const results = {};
+    
+    for (const source of sources) {
+      try {
+        console.log(`🔗 Testing ${source.name}...`);
+        
+        const response = await axios.get(source.url, {
+          timeout: 10000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        });
+        
+        results[source.name] = {
+          accessible: true,
+          status: response.status,
+          contentLength: response.data?.length || 0,
+          hasContent: response.data?.includes('sbc') || response.data?.includes('challenge') || false
+        };
+        
+        console.log(`✅ ${source.name}: ${response.status} (${results[source.name].contentLength} chars)`);
+        
+      } catch (error) {
+        console.error(`❌ ${source.name}: ${error.message}`);
+        results[source.name] = {
+          accessible: false,
+          error: error.message,
+          code: error.code
+        };
+      }
+    }
+    
+    res.json({
+      timestamp: new Date(),
+      sourceTests: results,
+      recommendation: Object.values(results).every(r => r.accessible) ? 
+        'All sources accessible - scraper should work' :
+        'Some sources blocked - check network/firewall'
+    });
+    
+  } catch (error) {
+    res.status(500).json({ error: 'Source test failed' });
   }
 });
 
@@ -299,6 +495,20 @@ if (process.env.NODE_ENV === 'production') {
     }
   });
 
+  // ENHANCED: Live SBC refresh schedule
+  cron.schedule('*/15 * * * *', async () => {
+    if (liveSBCScraper?.getActiveSBCs) {
+      try {
+        console.log('🎯 Scheduled SBC refresh...');
+        liveSBCScraper.sbcCache?.clear?.();
+        const sbcs = await liveSBCScraper.getActiveSBCs();
+        console.log(`✅ Scheduled SBC refresh: ${Array.isArray(sbcs) ? sbcs.length : 0} SBCs`);
+      } catch (e) {
+        console.error('❌ Scheduled SBC refresh failed:', e);
+      }
+    }
+  });
+
   cron.schedule('*/15 * * * *', async () => {
     if (!isInitialized) {
       console.log('🔁 Reinitializing (cron)…');
@@ -311,6 +521,7 @@ if (process.env.NODE_ENV === 'production') {
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🌐 Server listening on 0.0.0.0:${PORT}`);
   console.log(`💾 DB configured: ${Boolean(process.env.DATABASE_URL)}`);
+  console.log(`🎯 SBC Scraper loaded: ${Boolean(liveSBCScraper?.getActiveSBCs)}`);
   initializeSystem(); // fire and forget
 });
 
