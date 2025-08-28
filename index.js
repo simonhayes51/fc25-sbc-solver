@@ -12,23 +12,44 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 console.log('🚀 Starting FC25 SBC Solver...');
 
+// Initialize scraper instance
+let scraper = null;
+try {
+  const LiveScraper = require('./scraper');
+  scraper = new LiveScraper();
+  console.log('✅ Scraper initialized');
+} catch (error) {
+  console.error('❌ Scraper initialization failed:', error.message);
+}
+
 // Routes
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    message: 'FC25 SBC Solver running'
+    uptime: Math.floor(process.uptime()),
+    message: 'FC25 SBC Solver running',
+    scraperLoaded: scraper !== null,
+    version: '2.0.0'
   });
 });
 
 app.get('/api/sbc/live', async (req, res) => {
-  // Initialize scraper lazily
+  const { expand = 'false', limit } = req.query;
+  const shouldExpand = expand === 'true';
+  const limitNum = limit ? parseInt(limit, 10) : 10;
+  
+  console.log(`📡 SBC request: expand=${shouldExpand}, limit=${limitNum}`);
+
   try {
-    const LiveScraper = require('./scraper');
-    const scraper = new LiveScraper();
-    
-    const sbcs = await scraper.getActiveSBCs({ expand: false, limit: 10 });
+    if (!scraper) {
+      throw new Error('Scraper not initialized');
+    }
+
+    const sbcs = await scraper.getActiveSBCs({ 
+      expand: shouldExpand, 
+      limit: limitNum 
+    });
     
     res.json({
       success: true,
@@ -38,48 +59,130 @@ app.get('/api/sbc/live', async (req, res) => {
         source: sbc.source,
         expiry: sbc.expiresText,
         url: sbc.url,
-        segments: sbc.segmentCount
+        segments: sbc.segmentCount,
+        difficulty: sbc.difficulty,
+        estimatedCost: sbc.estimatedCost
       })),
-      lastUpdated: new Date().toISOString()
+      lastUpdated: new Date().toISOString(),
+      cached: sbcs.length > 0 && sbcs[0].source !== 'Mock Data'
     });
     
   } catch (error) {
-    console.warn('Scraper failed, using mock data:', error.message);
+    console.error('❌ SBC fetch failed:', error.message);
     
-    // Fallback mock data
-    const mockSBCs = [
+    // Enhanced fallback mock data
+    const fallbackSBCs = [
       {
         name: 'Icon Moments Ronaldinho',
-        source: 'Mock Data',
-        expiry: '14 days',
+        source: 'Fallback Data',
+        expiry: '14 days remaining',
         url: '#',
-        segments: 4
+        segments: 4,
+        difficulty: 'Expert',
+        estimatedCost: 2500000
       },
       {
         name: 'POTM Challenge',
-        source: 'Mock Data', 
-        expiry: '7 days',
+        source: 'Fallback Data',
+        expiry: '7 days remaining',
         url: '#',
-        segments: 3
+        segments: 3,
+        difficulty: 'Advanced', 
+        estimatedCost: 850000
+      },
+      {
+        name: 'Team of the Week',
+        source: 'Fallback Data',
+        expiry: '3 days remaining',
+        url: '#',
+        segments: 1,
+        difficulty: 'Intermediate',
+        estimatedCost: 45000
       }
     ];
     
     res.json({
       success: true,
-      count: mockSBCs.length,
-      sbcs: mockSBCs,
+      count: fallbackSBCs.length,
+      sbcs: fallbackSBCs.slice(0, limitNum),
       lastUpdated: new Date().toISOString(),
-      note: 'Using mock data - scraper unavailable'
+      cached: false,
+      note: 'Using fallback data - scraper temporarily unavailable',
+      error: error.message
     });
   }
 });
 
-app.get('/api/sbc/test', (req, res) => {
-  res.json({
-    message: 'SBC API working!',
-    endpoints: ['/api/health', '/api/sbc/live'],
-    timestamp: new Date().toISOString()
-  });
+// Test scraper connectivity
+app.get('/api/sbc/test', async (req, res) => {
+  try {
+    if (!scraper) {
+      return res.json({
+        success: false,
+        message: 'Scraper not initialized',
+        scraperLoaded: false
+      });
+    }
+
+    console.log('🧪 Testing scraper connectivity...');
+    const testResults = await scraper.testConnection();
+    
+    res.json({
+      success: true,
+      message: 'Scraper test completed',
+      scraperLoaded: true,
+      connectivity: testResults,
+      endpoints: ['/api/health', '/api/sbc/live', '/api/sbc/test'],
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('❌ Scraper test failed:', error.message);
+    
+    res.json({
+      success: false,
+      message: 'Scraper test failed',
+      error: error.message,
+      scraperLoaded: scraper !== null,
+      timestamp: new Date().toISOString()
+    });
+  }
+});
+
+// Refresh scraper cache manually
+app.post('/api/sbc/refresh', async (req, res) => {
+  try {
+    if (!scraper) {
+      return res.status(500).json({
+        success: false,
+        error: 'Scraper not initialized'
+      });
+    }
+
+    console.log('🔄 Manual cache refresh requested');
+    
+    // Clear cache
+    scraper.cache.clear();
+    
+    // Fetch fresh data
+    const sbcs = await scraper.getActiveSBCs({ limit: 10 });
+    
+    res.json({
+      success: true,
+      message: 'Cache refreshed successfully',
+      count: sbcs.length,
+      timestamp: new Date().toISOString()
+    });
+    
+  } catch (error) {
+    console.error('❌ Cache refresh failed:', error.message);
+    
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    });
+  }
 });
 
 // Root route
@@ -87,19 +190,45 @@ app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// Error handling
+// Error handling middleware
 app.use((error, req, res, next) => {
-  console.error('Error:', error);
-  res.status(500).json({ error: 'Internal server error' });
+  console.error('❌ Unhandled error:', error);
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: error.message,
+    timestamp: new Date().toISOString()
+  });
 });
 
+// 404 handler
 app.use((req, res) => {
-  res.status(404).json({ error: 'Not found' });
+  res.status(404).json({ 
+    error: 'Not found',
+    path: req.path,
+    availableEndpoints: [
+      '/api/health',
+      '/api/sbc/live', 
+      '/api/sbc/test',
+      'POST /api/sbc/refresh'
+    ]
+  });
 });
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`✅ Server running on http://0.0.0.0:${PORT}`);
-  console.log(`🌍 Health check: /api/health`);
-  console.log('🎯 FC25 SBC Solver ready!');
+  console.log(`✅ FC25 SBC Solver running on http://0.0.0.0:${PORT}`);
+  console.log(`🌍 Health check: http://0.0.0.0:${PORT}/api/health`);
+  console.log(`📊 Dashboard: http://0.0.0.0:${PORT}`);
+  console.log('🎯 Ready to find SBC solutions!');
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('📡 SIGTERM received - shutting down gracefully');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('📡 SIGINT received - shutting down gracefully');
+  process.exit(0);
 });
