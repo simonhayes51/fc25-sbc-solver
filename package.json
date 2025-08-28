@@ -4,7 +4,6 @@
   "description": "FC25 SBC Solution Finder with enhanced multi-source data collection",
   "main": "server.js",
   "scripts": {
-    "preinstall": "npm config set registry https://registry.npmjs.org/ && npm config set cache /tmp/.npm --location=global || true && npm config set prefer-online true && npm config set fetch-retries 5 && npm config set fetch-retry-factor 2 && npm config set fetch-retry-maxtimeout 60000 && npm cache clean --force || true",
     "start": "node server.js",
     "dev": "nodemon server.js",
     "build": "echo \"No build step required\"",
@@ -26,6 +25,5 @@
   "engines": {
     "node": ">=22"
   },
-  "license": "MIT",
-  "packageManager": "npm@10"
+  "license": "MIT"
 }
