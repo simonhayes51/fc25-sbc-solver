@@ -1,285 +1,524 @@
-// Focused FUT.GG-first SBC scraper with full segment requirements & reward
-// Deps: npm i axios cheerio
+// src/live-sbc-scraper.js - Fixed with proper error handling and axios
+const axios = require(‘axios’);
+const cheerio = require(‘cheerio’);
 
-const axios = require('axios');
-const cheerio = require('cheerio');
+const FUTGG_LIST = ‘https://www.fut.gg/sbc/’;
+const FUTBIN_LIST = ‘https://www.futbin.com/25/squad-building-challenges’;
 
-const FUTGG_LIST = 'https://www.fut.gg/sbc/';
-const FUTBIN_LIST = 'https://www.futbin.com/25/squad-building-challenges';
-
-const UA = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+const USER_AGENTS = [
+‘Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36’,
+‘Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Safari/605.1.15’,
+‘Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36’,
 ];
-const ua = () => UA[Math.floor(Math.random() * UA.length)];
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const tidy = (s) => (s || '').replace(/\s+/g, ' ').trim();
-const textOf = ($el) => tidy($el.text());
 
-function parseExpiry(raw) {
-  if (!raw) return null;
-  const lower = raw.toLowerCase();
-  const now = Date.now();
-  const DAY = 24 * 3600 * 1000;
-  const mDays = lower.match(/(\d+)\s*day/);
-  if (mDays) return new Date(now + Number(mDays[1]) * DAY).toISOString();
-  const mHM = lower.match(/(\d+)\s*h(?:\s*(\d+)\s*m)?/);
-  if (mHM) {
-    const h = Number(mHM[1]); const m = Number(mHM[2] || 0);
-    return new Date(now + (h * 3600 + m * 60) * 1000).toISOString();
-  }
-  return null;
+const getRandomUA = () => USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const cleanText = (str) => (str || ‘’).replace(/\s+/g, ’ ’).trim();
+
+function parseExpiry(text) {
+if (!text) return null;
+
+const lower = text.toLowerCase();
+const now = Date.now();
+const DAY_MS = 24 * 3600 * 1000;
+
+// Match “X days”
+const dayMatch = lower.match(/(\d+)\s*day/);
+if (dayMatch) {
+const days = parseInt(dayMatch[1]);
+return new Date(now + days * DAY_MS).toISOString();
 }
 
-async function getHTML(url) {
-  const r = await axios.get(url, {
+// Match “X hours” or “X hours Y minutes”
+const hourMatch = lower.match(/(\d+)\s*h(?:our)?(?:\s*(\d+)\s*m(?:in)?)?/);
+if (hourMatch) {
+const hours = parseInt(hourMatch[1]);
+const minutes = parseInt(hourMatch[2] || ‘0’);
+return new Date(now + (hours * 3600 + minutes * 60) * 1000).toISOString();
+}
+
+return null;
+}
+
+async function fetchHTML(url, retries = 3) {
+for (let i = 0; i < retries; i++) {
+try {
+console.log(`📡 Fetching: ${url} (attempt ${i + 1}/${retries})`);
+
+```
+  const response = await axios.get(url, {
     timeout: 15000,
     headers: {
-      'User-Agent': ua(),
-      'Accept': 'text/html,application/xhtml+xml',
-      'Accept-Language': 'en-GB,en;q=0.9',
+      'User-Agent': getRandomUA(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+      'Accept-Encoding': 'gzip, deflate, br',
       'Cache-Control': 'no-cache',
       'Pragma': 'no-cache',
+      'Connection': 'keep-alive',
+      'Upgrade-Insecure-Requests': '1'
     },
+    validateStatus: (status) => status < 500 // Don't retry on 4xx errors
   });
-  return String(r.data || '');
+  
+  if (response.status === 200 && response.data) {
+    console.log(`✅ Successfully fetched ${url} (${response.data.length} chars)`);
+    return String(response.data);
+  }
+  
+  throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+  
+} catch (error) {
+  console.warn(`❌ Attempt ${i + 1} failed for ${url}:`, error.message);
+  
+  if (i === retries - 1) {
+    throw new Error(`Failed to fetch ${url} after ${retries} attempts: ${error.message}`);
+  }
+  
+  // Wait before retry with exponential backoff
+  await sleep(1000 * Math.pow(2, i));
+}
+```
+
+}
 }
 
-/* ========== LIST (FUT.GG first, FUTBIN fallback) ========== */
-async function listFutGG() {
-  const html = await getHTML(FUTGG_LIST);
-  const $ = cheerio.load(html);
-  const items = [];
+async function scrapeFutGGList() {
+try {
+const html = await fetchHTML(FUTGG_LIST);
+const $ = cheerio.load(html);
+const items = [];
 
-  $('a[href*="/sbc/"]').each((_, a) => {
-    const $a = $(a);
-    const href = $a.attr('href') || '';
-    if (!/^\/sbc\/[a-z0-9-]+/i.test(href)) return;
+```
+console.log('🔍 Parsing FUT.GG SBC list...');
 
-    const name = textOf($a.find('[class*="title"],[class*="name"],h3,h2')) || textOf($a);
-    if (!name) return;
+// More comprehensive selectors for FUT.GG
+const candidates = $([
+  'a[href*="/sbc/"]',
+  '[class*="sbc"] a',
+  '[class*="challenge"] a',
+  '.card a[href*="/sbc/"]',
+  '.grid a[href*="/sbc/"]'
+].join(', '));
 
-    const expiresText =
-      textOf($a.find('[class*="expire"],[class*="ends"],[class*="remaining"]')) || '';
-    const segText =
-      textOf($a.find('[class*="segment"],[class*="segments"],[class*="badge"]')) || '';
-    const segMatch = segText.match(/(\d+)\s*segment/i);
-    const segmentCount = segMatch ? Number(segMatch[1]) : null;
+console.log(`📋 Found ${candidates.length} potential SBC links`);
 
-    items.push({
+candidates.each((_, element) => {
+  try {
+    const $link = $(element);
+    const href = $link.attr('href');
+    
+    if (!href || !href.match(/^\/sbc\/[a-z0-9-]+/i)) {
+      return; // Skip invalid links
+    }
+    
+    // Extract SBC name from various sources
+    let name = cleanText($link.find('[class*="title"], [class*="name"], h1, h2, h3, h4').first().text());
+    if (!name) {
+      name = cleanText($link.text());
+    }
+    if (!name) {
+      name = cleanText($link.attr('title') || '');
+    }
+    
+    if (!name || name.length < 3) {
+      return; // Skip if no valid name found
+    }
+    
+    // Look for expiry information
+    const $parent = $link.closest('.card, .item, [class*="sbc"], [class*="challenge"]');
+    const expiryText = cleanText($parent.find('[class*="expir"], [class*="end"], [class*="remain"], [class*="time"]').first().text());
+    
+    // Look for segment information
+    const segmentText = cleanText($parent.find('[class*="segment"], .badge, [class*="parts"]').first().text());
+    const segmentMatch = segmentText.match(/(\d+)\s*segment/i);
+    const segmentCount = segmentMatch ? parseInt(segmentMatch[1]) : null;
+    
+    const item = {
       source: 'FUT.GG',
       id: href.replace(/^\/sbc\//, '').replace(/\/$/, ''),
       url: new URL(href, 'https://www.fut.gg').toString(),
-      name,
+      name: name,
       segmentCount,
-      expiresText,
-      expiresAt: parseExpiry(expiresText),
-      updatedAt: new Date().toISOString(),
-    });
-  });
+      expiresText: expiryText || null,
+      expiresAt: parseExpiry(expiryText),
+      updatedAt: new Date().toISOString()
+    };
+    
+    items.push(item);
+    
+  } catch (error) {
+    console.warn('⚠️ Error parsing FUT.GG item:', error.message);
+  }
+});
 
-  // dedupe
-  const seen = new Set();
-  return items.filter(x => {
-    const k = `${x.source}:${x.id}:${x.name}`.toLowerCase();
-    if (seen.has(k)) return false; seen.add(k); return true;
-  });
+// Remove duplicates based on name and ID
+const seen = new Set();
+const unique = items.filter(item => {
+  const key = `${item.source}:${item.id}:${item.name.toLowerCase()}`;
+  if (seen.has(key)) return false;
+  seen.add(key);
+  return true;
+});
+
+console.log(`✅ FUT.GG: Found ${unique.length} unique SBCs`);
+return unique;
+```
+
+} catch (error) {
+console.error(‘❌ FUT.GG scraping failed:’, error.message);
+return [];
+}
 }
 
-async function listFutbinFallback() {
-  // Only used if FUT.GG list fails/empty
-  const html = await getHTML(FUTBIN_LIST);
-  const $ = cheerio.load(html);
-  const items = [];
-  $('a[href*="/25/sbc/"], a[href*="/25/squad-building-challenges/"]').each((_, a) => {
-    const $a = $(a);
-    const href = $a.attr('href') || '';
-    if (!/\/25\/sbc\//i.test(href) && !/\/25\/squad-building-challenges\//i.test(href)) return;
+async function scrapeFutbinFallback() {
+try {
+const html = await fetchHTML(FUTBIN_LIST);
+const $ = cheerio.load(html);
+const items = [];
 
-    const name = textOf($a.find('.title, .name, h3, h2')) || textOf($a);
-    if (!name) return;
+```
+console.log('🔍 Parsing FUTBIN SBC list (fallback)...');
 
-    const expiresText =
-      textOf($a.find('[class*="expire"],[class*="ends"],[class*="remain"]')) ||
-      textOf($a.parent().find('[class*="expire"],[class*="ends"],[class*="remain"]')) || '';
+// FUTBIN selectors
+const candidates = $([
+  'a[href*="/25/sbc/"]',
+  'a[href*="/squad-building-challenge/"]',
+  '.sbc-card a',
+  '[class*="sbc"] a'
+].join(', '));
 
-    const segText = textOf($a.find('[class*="segment"],[class*="segments"],small,.badge')) || '';
-    const segMatch = segText.match(/(\d+)\s*segment/i) || segText.match(/\((\d+)\)/);
-    const segmentCount = segMatch ? Number(segMatch[1]) : null;
+console.log(`📋 Found ${candidates.length} potential FUTBIN links`);
 
-    const abs = href.startsWith('http') ? href : `https://www.futbin.com${href}`;
+candidates.each((_, element) => {
+  try {
+    const $link = $(element);
+    const href = $link.attr('href');
+    
+    if (!href || (!href.includes('/25/sbc/') && !href.includes('/squad-building-challenge/'))) {
+      return;
+    }
+    
+    let name = cleanText($link.find('.title, .name, h3, h4').first().text());
+    if (!name) {
+      name = cleanText($link.text());
+    }
+    
+    if (!name || name.length < 3) {
+      return;
+    }
+    
+    const $parent = $link.closest('.card, .item, [class*="sbc"]');
+    const expiryText = cleanText($parent.find('[class*="expir"], [class*="end"], [class*="remain"]').first().text());
+    
+    const segmentText = cleanText($parent.find('[class*="segment"], .badge, small').first().text());
+    const segmentMatch = segmentText.match(/(\d+)\s*segment/i) || segmentText.match(/\((\d+)\)/);
+    const segmentCount = segmentMatch ? parseInt(segmentMatch[1]) : null;
+    
+    const fullUrl = href.startsWith('http') ? href : `https://www.futbin.com${href}`;
     const id = href
       .replace(/^\/25\/sbc\//, '')
-      .replace(/^\/25\/squad-building-challenges\//, '')
+      .replace(/^\/squad-building-challenge\//, '')
       .replace(/\/$/, '');
-
-    items.push({
+    
+    const item = {
       source: 'FUTBIN',
       id,
-      url: abs,
+      url: fullUrl,
       name,
       segmentCount,
-      expiresText,
-      expiresAt: parseExpiry(expiresText),
-      updatedAt: new Date().toISOString(),
-    });
-  });
+      expiresText: expiryText || null,
+      expiresAt: parseExpiry(expiryText),
+      updatedAt: new Date().toISOString()
+    };
+    
+    items.push(item);
+    
+  } catch (error) {
+    console.warn('⚠️ Error parsing FUTBIN item:', error.message);
+  }
+});
 
-  const seen = new Set();
-  return items.filter(x => {
-    const k = `${x.source}:${x.id}:${x.name}`.toLowerCase();
-    if (seen.has(k)) return false; seen.add(k); return true;
-  });
+const seen = new Set();
+const unique = items.filter(item => {
+  const key = `${item.source}:${item.id}:${item.name.toLowerCase()}`;
+  if (seen.has(key)) return false;
+  seen.add(key);
+  return true;
+});
+
+console.log(`✅ FUTBIN: Found ${unique.length} unique SBCs`);
+return unique;
+```
+
+} catch (error) {
+console.error(‘❌ FUTBIN scraping failed:’, error.message);
+return [];
+}
 }
 
-/* ========== DETAIL (FUT.GG full requirements) ========== */
-async function detailFutGG(url) {
-  const html = await getHTML(url);
-  const $ = cheerio.load(html);
+async function scrapeSBCDetails(url) {
+try {
+const html = await fetchHTML(url);
+const $ = cheerio.load(html);
 
-  // Try to pick up SBC title from page as a sanity check
-  const pageTitle =
-    tidy($('h1').first().text()) ||
-    tidy($('[class*="title"],[class*="name"]').first().text()) ||
-    null;
+```
+console.log(`🔍 Parsing SBC details from ${url}`);
 
-  // Segments are usually rendered as cards/rows; be generous with selectors
-  const segments = [];
-  const containers = $(
-    // common FUT.GG segment container patterns
-    '[class*="segment-card"], [data-testid*="segment"], [class*="Segment"], .card, .panel, .grid, .list'
-  );
+// Extract page title
+const pageTitle = cleanText($('h1').first().text()) ||
+                 cleanText($('[class*="title"], [class*="name"]').first().text()) ||
+                 null;
 
-  containers.each((_, c) => {
-    const $c = $(c);
+// Find segments/challenges
+const segments = [];
+const segmentSelectors = [
+  '[class*="segment"]',
+  '[class*="challenge"]',
+  '.card',
+  '.panel',
+  '[data-testid*="segment"]',
+  '.grid > div',
+  '.list > div'
+];
 
-    // Segment name candidates
-    const segName =
-      textOf($c.find('h3, h4, [class*="title"], [class*="name"]')) ||
-      textOf($c.find('a[href*="/squad/"], a[href*="/challenge/"]'));
-
-    // Requirements – usually bullet lists
-    const requirements = [];
-    $c.find('ul li, .requirements li, [class*="requirement"]').each((__, li) => {
-      const t = textOf($(li));
-      if (t && !requirements.includes(t)) requirements.push(t);
-    });
-
-    // Reward / pack text
-    const reward =
-      textOf($c.find('[class*="reward"], .badge:contains("Reward"), [class*="pack"]')) || '';
-    // Optional on-page “cost”/“price” summaries (textual)
-    const costText =
-      textOf($c.find('[class*="cost"], [class*="price"], .badge:contains("Cost")')) || '';
-
-    // Filter out generic layout cards: require a plausible name + at least some data
-    if (segName && (requirements.length || reward || costText)) {
-      segments.push({
-        name: segName,
-        requirements,
-        reward: reward || null,
-        costText: costText || null,
-      });
-    }
-  });
-
-  // Deduplicate by name
-  const seen = new Set();
-  const unique = segments.filter(s => {
-    const k = s.name.toLowerCase();
-    if (seen.has(k)) return false;
-    seen.add(k); return true;
-  });
-
-  return { pageTitle, segments: unique };
-}
-
-/* ========== Aggregator + Cache ========== */
-class LiveSBCScraper {
-  constructor(opts = {}) {
-    this.ttlMs = Number(opts.ttlMs || 10 * 60 * 1000);      // 10 min cache
-    this.detailDelayMs = Number(opts.detailDelayMs || 350); // politeness
-    this.sbcCache = new Map(); // 'LIVE_LIST' / `DETAIL:${url}`
-  }
-
-  _get(k) {
-    const e = this.sbcCache.get(k);
-    if (!e) return null;
-    if (Date.now() - e.ts > this.ttlMs) { this.sbcCache.delete(k); return null; }
-    return e.data;
-  }
-  _set(k, data) { this.sbcCache.set(k, { ts: Date.now(), data }); }
-
-  async listAll() {
-    const cached = this._get('LIVE_LIST');
-    if (cached) return cached;
-
-    let list = [];
+for (const selector of segmentSelectors) {
+  const containers = $(selector);
+  
+  containers.each((_, container) => {
     try {
-      list = await listFutGG();
-    } catch (e) {
-      console.warn('[SBC] FUT.GG list failed:', e.message);
-    }
-    if (!list.length) {
-      try { list = await listFutbinFallback(); }
-      catch (e) { console.warn('[SBC] FUTBIN fallback list failed:', e.message); }
-    }
-
-    this._set('LIVE_LIST', list);
-    return list;
-  }
-
-  async expand(item) {
-    if (!item?.url) return { ...item, segments: [] };
-    const ck = `DETAIL:${item.url}`;
-    const cached = this._get(ck);
-    if (cached) return { ...item, segments: cached.segments };
-
-    let detail = { pageTitle: null, segments: [] };
-    try {
-      if (item.source === 'FUTBIN') {
-        // prefer to re-point FUTBIN list item to FUT.GG detail if a matching slug exists?
-        // (kept simple: if FUTBIN, we still try its URL via FUT.GG parser first; if empty, leave [])
-        detail = await detailFutGG(item.url.includes('fut.gg')
-          ? item.url
-          : item.url.replace('https://www.futbin.com/25/sbc/', 'https://www.fut.gg/sbc/'));
-      } else {
-        detail = await detailFutGG(item.url);
+      const $container = $(container);
+      
+      // Extract segment name
+      const segmentName = cleanText(
+        $container.find('h2, h3, h4, [class*="title"], [class*="name"]').first().text() ||
+        $container.find('a[href*="/squad/"], a[href*="/challenge/"]').first().text()
+      );
+      
+      if (!segmentName || segmentName.length < 3) {
+        return; // Skip if no valid segment name
       }
-    } catch (e) {
-      console.warn(`[SBC] detail fetch failed for ${item.url}:`, e.message);
+      
+      // Extract requirements
+      const requirements = [];
+      $container.find('ul li, .requirements li, [class*="requirement"], .badge').each((_, reqElement) => {
+        const reqText = cleanText($(reqElement).text());
+        if (reqText && !requirements.includes(reqText) && reqText.length < 100) {
+          requirements.push(reqText);
+        }
+      });
+      
+      // Extract reward information
+      const reward = cleanText(
+        $container.find('[class*="reward"], [class*="pack"], .badge:contains("Pack")').first().text()
+      ) || null;
+      
+      // Extract cost information if available
+      const costText = cleanText(
+        $container.find('[class*="cost"], [class*="price"]').first().text()
+      ) || null;
+      
+      // Only add if we have meaningful data
+      if (segmentName && (requirements.length > 0 || reward || costText)) {
+        segments.push({
+          name: segmentName,
+          requirements,
+          reward,
+          costText
+        });
+      }
+      
+    } catch (error) {
+      console.warn('⚠️ Error parsing segment:', error.message);
     }
+  });
+  
+  // If we found segments, break
+  if (segments.length > 0) break;
+}
 
-    this._set(ck, detail);
-    return { ...item, segments: detail.segments || [] };
+// Remove duplicates
+const seen = new Set();
+const uniqueSegments = segments.filter(segment => {
+  const key = segment.name.toLowerCase();
+  if (seen.has(key)) return false;
+  seen.add(key);
+  return true;
+});
+
+console.log(`✅ Found ${uniqueSegments.length} segments for ${pageTitle || 'SBC'}`);
+
+return {
+  pageTitle,
+  segments: uniqueSegments
+};
+```
+
+} catch (error) {
+console.error(`❌ Failed to parse details for ${url}:`, error.message);
+return { pageTitle: null, segments: [] };
+}
+}
+
+class LiveSBCScraper {
+constructor(options = {}) {
+this.ttlMs = options.ttlMs || 10 * 60 * 1000; // 10 minutes cache
+this.detailDelayMs = options.detailDelayMs || 350; // Politeness delay
+this.sbcCache = new Map(); // Cache for both list and details
+
+```
+console.log('🎯 LiveSBCScraper initialized with options:', {
+  ttlMs: this.ttlMs,
+  detailDelayMs: this.detailDelayMs
+});
+```
+
+}
+
+_getCached(key) {
+const entry = this.sbcCache.get(key);
+if (!entry) return null;
+
+```
+if (Date.now() - entry.timestamp > this.ttlMs) {
+  this.sbcCache.delete(key);
+  return null;
+}
+
+return entry.data;
+```
+
+}
+
+_setCache(key, data) {
+this.sbcCache.set(key, {
+data,
+timestamp: Date.now()
+});
+}
+
+async listAll() {
+const cached = this._getCached(‘LIVE_LIST’);
+if (cached) {
+console.log(‘📋 Using cached SBC list’);
+return cached;
+}
+
+```
+console.log('🔄 Fetching fresh SBC list...');
+
+let sbcList = [];
+
+// Try FUT.GG first
+try {
+  sbcList = await scrapeFutGGList();
+  console.log(`✅ FUT.GG returned ${sbcList.length} SBCs`);
+} catch (error) {
+  console.warn('⚠️ FUT.GG failed:', error.message);
+}
+
+// Fallback to FUTBIN if FUT.GG failed or returned no results
+if (sbcList.length === 0) {
+  try {
+    console.log('🔄 Trying FUTBIN fallback...');
+    sbcList = await scrapeFutbinFallback();
+    console.log(`✅ FUTBIN returned ${sbcList.length} SBCs`);
+  } catch (error) {
+    console.warn('⚠️ FUTBIN fallback failed:', error.message);
   }
+}
 
-  /**
-   * getActiveSBCs({ expand=false, limit=null })
-   * - expand: include full segments (requirements + reward)
-   * - limit: only expand the first N SBCs
-   */
-  async getActiveSBCs({ expand = false, limit = null } = {}) {
-    const list = await this.listAll();
-    if (!expand) return list;
+// Cache the results
+this._setCache('LIVE_LIST', sbcList);
 
-    const targets = typeof limit === 'number' ? list.slice(0, limit) : list;
-    const out = [];
-    for (const it of targets) {
-      out.push(await this.expand(it));
-      await sleep(this.detailDelayMs);
-    }
-    if (typeof limit === 'number' && list.length > limit) {
-      return [...out, ...list.slice(limit)];
-    }
-    return out;
+console.log(`📊 Total SBCs found: ${sbcList.length}`);
+return sbcList;
+```
+
+}
+
+async expand(sbcItem) {
+if (!sbcItem?.url) {
+return { …sbcItem, segments: [] };
+}
+
+```
+const cacheKey = `DETAIL:${sbcItem.url}`;
+const cached = this._getCached(cacheKey);
+
+if (cached) {
+  return { ...sbcItem, segments: cached.segments };
+}
+
+console.log(`🔍 Expanding details for: ${sbcItem.name}`);
+
+try {
+  const details = await scrapeSBCDetails(sbcItem.url);
+  this._setCache(cacheKey, details);
+  
+  return {
+    ...sbcItem,
+    segments: details.segments || []
+  };
+  
+} catch (error) {
+  console.error(`❌ Failed to expand ${sbcItem.name}:`, error.message);
+  return { ...sbcItem, segments: [] };
+}
+```
+
+}
+
+async getActiveSBCs(options = {}) {
+const { expand = false, limit = null } = options;
+
+```
+console.log('🎯 Getting active SBCs with options:', { expand, limit });
+
+const sbcList = await this.listAll();
+
+if (!expand) {
+  return sbcList;
+}
+
+// Determine which SBCs to expand
+const toExpand = typeof limit === 'number' ? sbcList.slice(0, limit) : sbcList;
+const expanded = [];
+
+console.log(`🔄 Expanding ${toExpand.length} SBCs...`);
+
+for (let i = 0; i < toExpand.length; i++) {
+  const sbc = toExpand[i];
+  
+  console.log(`📈 Expanding ${i + 1}/${toExpand.length}: ${sbc.name}`);
+  
+  const expandedSBC = await this.expand(sbc);
+  expanded.push(expandedSBC);
+  
+  // Add delay between requests to be polite
+  if (i < toExpand.length - 1) {
+    await sleep(this.detailDelayMs);
   }
+}
 
-  async getDetailByUrl(url) {
-    const { segments } = await detailFutGG(url);
-    return { url, segments };
-  }
+// If we have a limit, append the non-expanded items
+if (typeof limit === 'number' && sbcList.length > limit) {
+  const remaining = sbcList.slice(limit);
+  return [...expanded, ...remaining];
+}
+
+return expanded;
+```
+
+}
+
+async getDetailByUrl(url) {
+const details = await scrapeSBCDetails(url);
+return {
+url,
+segments: details.segments || []
+};
+}
 }
 
 module.exports = LiveSBCScraper;
