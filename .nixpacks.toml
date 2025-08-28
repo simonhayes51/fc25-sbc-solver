@@ -1,2 +1,3 @@
+# Minimal nixpacks config
 [start]
 cmd = "node server.js"
