@@ -3,11 +3,17 @@
 version = "22"
 
 [phases.install]
-# Use npm install to avoid strict lockfile integrity checks for now
-cmds = ["npm install --omit=dev"]
+cmds = [
+  # Make npm prefer fresh network fetches and isolate cache per build
+  "npm config set prefer-online true",
+  "npm config set cache /tmp/.npm --location=global",
+  "npm cache clean --force || true",
+  # Install only prod deps (skips nodemon)
+  "npm install --omit=dev --no-audit --no-fund"
+]
 
 [phases.build]
-cmds = []  # Express API, no build step
+cmds = []  # no build for Express API
 
 [start]
 cmd = "node server.js"
