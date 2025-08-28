@@ -12,19 +12,29 @@
   },
   "dependencies": {
     "axios": "1.6.8",
-    "express": "4.19.2", 
-    "cheerio": "1.0.0-rc.12",
-    "cors": "^2.8.5",
-    "lodash": "^4.17.21"
+    "cheerio": "1.0.0-rc.12", 
+    "cors": "2.8.5",
+    "express": "4.19.2",
+    "lodash": "4.17.21"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "nodemon": "3.1.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": "18.x",
+    "npm": ">=9.0.0"
   },
   "license": "MIT",
-  "keywords": ["fifa", "fc25", "sbc", "squad-building-challenge", "fut", "ultimate-team"],
+  "keywords": [
+    "fifa",
+    "fc25", 
+    "sbc",
+    "squad-building-challenge",
+    "fut",
+    "ultimate-team",
+    "soccer",
+    "football"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/yourusername/fc25-sbc-solver.git"
