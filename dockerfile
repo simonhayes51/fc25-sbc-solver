@@ -14,9 +14,8 @@ ENV NODE_ENV=production \
 
 WORKDIR /app
 
-# Install only production deps first (better layer caching)
+# Install only production deps first (fast rebuilds, no dev deps)
 COPY package*.json ./
-# nuke any stale cache and install prod deps (no devs like nodemon)
 RUN npm cache clean --force || true \
  && rm -rf /root/.npm/_cacache || true \
  && npm config set registry https://registry.npmjs.org/ \
