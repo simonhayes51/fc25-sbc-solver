@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.env
+.env.local
+.env.production
+package-lock.json
+yarn.lock
+.DS_Store
+coverage/
+.railway/
