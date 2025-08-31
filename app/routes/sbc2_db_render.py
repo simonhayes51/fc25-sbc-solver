@@ -10,6 +10,11 @@ import asyncpg
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
+import re
+
+def normalize_version_id(code: str | int | None) -> str:
+    """Digits-only version of any code; strips things like '25-' prefixes."""
+    return re.sub(r"\D", "", str(code or ""))
 
 from app.services.sbc_solution_scraper import (
     list_sbc_player_slugs,
