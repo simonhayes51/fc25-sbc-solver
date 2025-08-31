@@ -1,16 +1,20 @@
 from __future__ import annotations
+
+import os
+from html import escape
+from typing import Any, Dict, List, Optional
+from urllib.parse import urljoin
+
+import aiohttp
+import asyncpg
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
-from urllib.parse import urljoin
-import os
-import asyncpg
-import aiohttp
-from html import escape
 
 from app.services.sbc_solution_scraper import (
-    list_sbc_player_slugs, parse_sbc_page, parse_solution_players
+    list_sbc_player_slugs,
+    parse_sbc_page,
+    parse_solution_players,
 )
 
 # Price service: if you don't have it yet, this stub returns None
@@ -22,7 +26,7 @@ except Exception:
 
 router = APIRouter(prefix="/api/sbc2", tags=["SBC2"])
 
-# ---------------- DB ----------------
+# ---------- DB ----------
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sbc_sets (
   slug TEXT PRIMARY KEY,
@@ -52,14 +56,15 @@ async def get_pool() -> asyncpg.Pool:
     return await asyncpg.create_pool(dsn, min_size=1, max_size=5)
 
 def format_coins(n: Optional[int]) -> str:
-    if n is None: return "—"
+    if n is None:
+        return "—"
     return f"{n:,}c"
 
 async def variant_code_to_player_id(con: asyncpg.Connection, code: str) -> Optional[int]:
-    # 👇 change these columns to match your schema (variant/version id)
+    # 👇 change columns to match your schema (variant/version id)
     row = await con.fetchrow(
         "SELECT id FROM fut_players WHERE variant_code = $1 OR version_id::text = $1 LIMIT 1",
-        code
+        code,
     )
     return row["id"] if row else None
 
@@ -84,7 +89,9 @@ body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:
 .wrap{{max-width:1080px;margin:0 auto;padding:16px}}
 h1{{font-size:20px;margin:0 0 8px}}
 .subtitle{{opacity:.8;margin-bottom:16px}}
-.pitch{{position:relative;width:100%;padding-top:62%;background:linear-gradient(#0f4d0f,#0b390b);border:2px solid #1f5f1f;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.3);margin-bottom:16px}}
+.pitch{{position:relative;width:100%;padding-top:62%;
+  background:linear-gradient(#0f4d0f,#0b390b);border:2px solid #1f5f1f;border-radius:16px;
+  box-shadow:0 10px 30px rgba(0,0,0,.3);margin-bottom:16px}}
 .slot{{position:absolute;width:12%;transform:translate(-50%,-50%);text-align:center}}
 .card{{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:6px 6px 8px}}
 .name{{font-size:12px;line-height:1.2;margin-top:4px}}
@@ -99,8 +106,7 @@ h1{{font-size:20px;margin:0 0 8px}}
 <div class='total'>Total: {escape(total_txt)}</div>
 </div></body></html>"""
 
-# -------------- routes --------------
-
+# ---------- Routes ----------
 @router.post("/ingest/init-schema")
 async def init_schema():
     pool = await get_pool()
@@ -158,7 +164,7 @@ async def ingest_all(payload: IngestIn):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# Convenient GET wrappers (clickable from browser)
+# Convenience GET wrappers
 @router.get("/ingest/init-schema")
 async def init_schema_get():
     return await init_schema()
@@ -189,30 +195,44 @@ async def sbc_challenges(path: str):
         "slug": entry.slug,
         "title": entry.title,
         "challenges": [
-            {"name": c.name, "coin_text": c.coin_text, "block_text": c.block_text, "view_solution_url": c.view_solution_url}
+            {
+                "name": c.name,
+                "coin_text": c.coin_text,
+                "block_text": c.block_text,
+                "view_solution_url": c.view_solution_url,
+            }
             for c in entry.challenges
-        ]
+        ],
     }
 
 @router.get("/challenges/{path:path}/")
 async def sbc_challenges_alias(path: str):
     return await sbc_challenges(path)
 
-# Render by SBC slug + challenge name (lenient matching across duplicate names)
+# Debug: show what players we parsed from a solution URL
+@router.get("/debug/solution-players")
+async def debug_solution_players(solution_url: str):
+    solution_url = urljoin("https://www.fut.gg", solution_url)
+    async with aiohttp.ClientSession() as s:
+        players = await parse_solution_players(s, solution_url)
+    return {
+        "count": len(players),
+        "variant_codes": [p.get("variant_code") for p in players],
+        "sample": players[:11],
+    }
+
+# Render by SBC slug + challenge name (lenient across duplicate names)
 @router.get("/render", response_class=HTMLResponse)
 async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
     async with aiohttp.ClientSession() as s:
         entry = await parse_sbc_page(s, slug)
 
         wanted = challenge.lower().strip()
-        chall = next((c for c in entry.challenges
-                      if c.name.lower().strip() == wanted and c.view_solution_url), None)
+        chall = next((c for c in entry.challenges if c.name.lower().strip() == wanted and c.view_solution_url), None)
         if not chall:
-            chall = next((c for c in entry.challenges
-                          if c.name.lower().strip() == wanted), None)
+            chall = next((c for c in entry.challenges if c.name.lower().strip() == wanted), None)
         if chall and not chall.view_solution_url:
-            twin = next((c for c in entry.challenges
-                         if c.name.lower().strip() == wanted and c.view_solution_url), None)
+            twin = next((c for c in entry.challenges if c.name.lower().strip() == wanted and c.view_solution_url), None)
             if twin:
                 chall = twin
         if not chall or not chall.view_solution_url:
@@ -226,6 +246,14 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
             raise HTTPException(404, "No View Solution URL on this challenge")
 
         players = await parse_solution_players(s, chall.view_solution_url)
+
+    if not players:
+        # Helpful hint + debug route for this exact URL
+        raise HTTPException(
+            status_code=502,
+            detail="Parsed 0 players from the solution page. "
+                   "Try /api/sbc2/debug/solution-players?solution_url=<same-url> to inspect."
+        )
 
     pool = await get_pool()
     total = 0
@@ -253,6 +281,13 @@ async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
     async with aiohttp.ClientSession() as s:
         players = await parse_solution_players(s, solution_url)
 
+    if not players:
+        raise HTTPException(
+            status_code=502,
+            detail="Parsed 0 players from the solution page. "
+                   "Try /api/sbc2/debug/solution-players?solution_url=<same-url> to inspect."
+        )
+
     pool = await get_pool()
     total = 0
     cards: List[Dict[str, Any]] = []
@@ -278,12 +313,15 @@ async def debug_schema():
     pool = await get_pool()
     async with pool.acquire() as con:
         async def cols(table):
-            rows = await con.fetch("""
+            rows = await con.fetch(
+                """
                 SELECT column_name, data_type
                 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name=$1
                 ORDER BY ordinal_position
-            """, table)
+                """,
+                table,
+            )
             return [dict(r) for r in rows]
         return {
             "sbc_sets": await cols("sbc_sets"),
