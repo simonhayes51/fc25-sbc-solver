@@ -1,66 +1,43 @@
 # app/lib/sbc2_extract.py
 import re
-from typing import List, Tuple
+from typing import List
 
-# Match player-item images like:
-# https://game-assets.fut.gg/.../player-item/25-67356379.<hash>.webp
-IMG_PLAYER_ITEM_ID = re.compile(r'/player-item/25-(\d+)[^"\']*?\.webp', re.I)
+# Find FUT.GG player-item images and capture the number after 25-
+# Example: /2025/player-item/25-67356379.f2c6...webp  -> 67356379
+_RE_CODE = re.compile(r"/player-item/25-(\d+)\.", re.IGNORECASE)
 
-# Fallback: sometimes anchors show /players/.../25-<id>/
-ANCHOR_PLAYER_ID = re.compile(r'/players/\d+-[^/]+/25-(\d+)/', re.I)
-
-# Optional: collect all webp image URLs to help diagnose or fallback by image_url
-IMG_PLAYER_ITEM_URL = re.compile(
-    r'https?://[^"\']+/player-item/25-\d+[^"\']*?\.webp', re.I
-)
-
-def extract_player_ids_from_html(html: str) -> List[str]:
-    """Primary extractor: 11 ids from /player-item/25-<digits>.webp; fallback to anchors."""
-    if not html:
-        return []
+def _dedupe_keep_order(items: List[str]) -> List[str]:
     seen = set()
-    out: List[str] = []
-
-    for m in IMG_PLAYER_ITEM_ID.finditer(html):
-        pid = m.group(1)
-        if pid not in seen:
-            seen.add(pid)
-            out.append(pid)
-            if len(out) == 11:
-                break
-
-    if len(out) < 11:
-        for m in ANCHOR_PLAYER_ID.finditer(html):
-            pid = m.group(1)
-            if pid not in seen:
-                seen.add(pid)
-                out.append(pid)
-                if len(out) == 11:
-                    break
-
+    out = []
+    for x in items:
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
     return out
 
-def extract_player_image_urls(html: str) -> List[str]:
-    """Return the full player-item image URLs (ends with .webp)."""
+def extract_player_codes_from_html(html: str) -> List[str]:
     if not html:
         return []
-    seen = set()
-    out: List[str] = []
-    for m in IMG_PLAYER_ITEM_URL.finditer(html):
-        url = m.group(0)
-        if url not in seen:
-            seen.add(url)
-            out.append(url)
-            if len(out) == 11:
-                break
-    return out
 
-def count_webp_total(html: str) -> int:
-    """Diagnostic: count *any* .webp occurrences (not only player-item)."""
-    return len(re.findall(r'\.webp(?=["\'])', html, re.I))
+    # Collect values of src=, data-src=, srcset=
+    urls: List[str] = []
 
-def debug_summary(html: str) -> Tuple[int, int]:
-    """Return (total .webp count, player-item ids found)."""
-    total_webp = count_webp_total(html)
-    ids = extract_player_ids_from_html(html)
-    return total_webp, len(ids)
+    # quoted attribute values
+    for attr in ("src", "data-src", "srcset"):
+        for m in re.finditer(rf'\b{attr}\s*=\s*("|\')([^"\']+)\1', html, re.IGNORECASE):
+            val = m.group(2)
+            if attr.lower() == "srcset":
+                # srcset: "url1 1x, url2 2x"
+                urls += [p.strip().split(" ")[0] for p in val.split(",") if p.strip()]
+            else:
+                urls.append(val)
+
+    # Extract codes only from player-item .webp URLs
+    codes: List[str] = []
+    for u in urls:
+        if "/player-item/" in u and u.lower().endswith(".webp"):
+            m = _RE_CODE.search(u)
+            if m:
+                codes.append(m.group(1))
+
+    return _dedupe_keep_order(codes)
