@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from typing import List, Optional, Dict
 from urllib.parse import urljoin, urlparse
 
+from app.services.browser import get_browser
+
 FUTGG_BASE = "https://www.fut.gg"
 
 # ---------- Models ----------
@@ -24,9 +26,8 @@ class SbcEntry:
     challenges: List[ChallengeBlock]
 
 # ---------- Regex ----------
-# “View Solution” is detected by text and/or href containing /squad-builder/
-_COINS_RE = re.compile(r"([\d,]+)\s*(?:Image:\s*)?(?:FC\s*Coin|Coins?)", re.IGNORECASE)
 PLAYER_ANCHOR_RE = re.compile(r"/players/\d+(?:-[^/]+)?/25-(\d+)(?:/|$)")
+_COINS_RE = re.compile(r"([\d,]+)\s*(?:Image:\s*)?(?:FC\s*Coin|Coins?)", re.IGNORECASE)
 
 # ---------- Utils ----------
 def normalize_version_id(code: str | int | None) -> str:
@@ -69,7 +70,7 @@ def _is_view_solution_anchor(a) -> bool:
             return True
     return False
 
-# ---------- Public: index ----------
+# ---------- Index ----------
 async def list_sbc_player_slugs(session: aiohttp.ClientSession, index_url: str = f"{FUTGG_BASE}/sbc/") -> List[str]:
     html = await _fetch(session, index_url)
     soup = BeautifulSoup(html, "html.parser")
@@ -88,11 +89,8 @@ async def list_sbc_player_slugs(session: aiohttp.ClientSession, index_url: str =
             out.append(s); seen.add(s)
     return out
 
-# ---------- Public: SBC page -> challenges ----------
+# ---------- SBC page -> challenges ----------
 async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
-    """
-    Find challenge sections and their 'View Solution' link (absolute URL).
-    """
     url = slug if slug.startswith("http") else f"{FUTGG_BASE}/sbc/{slug}"
     html = await _fetch(session, url)
     soup = BeautifulSoup(html, "html.parser")
@@ -106,14 +104,13 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
     for i, header in enumerate(headers):
         name = header.get_text(" ", strip=True)
         if name.strip().lower() == (title or "").strip().lower():
-            continue  # skip page hero header
+            continue
 
         next_header = headers[i + 1] if i + 1 < len(headers) else None
 
         view_solution_url: Optional[str] = None
         text_parts: List[str] = []
 
-        # walk this section until next header
         for node in header.next_elements:
             if node is header:
                 continue
@@ -141,7 +138,7 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
                 )
             )
 
-    # fallback: map any global view-solution button to nearest header
+    # Fallback: map global /squad-builder/ anchors to nearest header
     if not any(c.view_solution_url for c in challenges):
         for a in soup.find_all("a", href=True):
             if _is_view_solution_anchor(a):
@@ -153,7 +150,7 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
                             c.view_solution_url = urljoin(FUTGG_BASE, a["href"])
                             break
 
-    # prefer challenge entries that actually have links when names repeat
+    # Prefer entries with links when duplicate names exist
     seen_by_name: Dict[str, ChallengeBlock] = {}
     for c in challenges:
         key = c.name.lower().strip()
@@ -163,13 +160,11 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
 
     return SbcEntry(slug=slug.strip("/"), title=title, challenges=challenges)
 
-# ---------- Public: solution page -> players (anchor-only) ----------
-async def parse_solution_players(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
+# ---------- Solution page -> players ----------
+async def _parse_solution_players_http(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
     """
-    ONLY extract from anchors like:
-      /players/258980-alessia-russo/25-100922276/
-    Returns list of {name, href, variant_code}, where variant_code is the
-    digits after '25-' (leading zeros stripped).
+    Fast path: parse raw HTML for anchors like /players/.../25-<digits>/
+    (works only if links are server-rendered).
     """
     solution_url = urljoin(FUTGG_BASE, solution_url)
     html = await _fetch(session, solution_url)
@@ -178,7 +173,7 @@ async def parse_solution_players(session: aiohttp.ClientSession, solution_url: s
     raw: List[Dict[str, str]] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
-        path = urlparse(href).path  # works for absolute or relative URLs
+        path = urlparse(href).path
         m = PLAYER_ANCHOR_RE.search(path or "")
         if not m:
             continue
@@ -193,3 +188,49 @@ async def parse_solution_players(session: aiohttp.ClientSession, solution_url: s
         if vc and vc not in seen:
             out.append(p); seen.add(vc)
     return out
+
+async def _parse_solution_players_browser(solution_url: str) -> List[Dict[str, str]]:
+    """
+    Slow but robust: use Playwright to render, then collect the same anchors.
+    """
+    browser = await get_browser()
+    context = await browser.new_context(ignore_https_errors=True)
+    page = await context.new_page()
+    try:
+        url = urljoin(FUTGG_BASE, solution_url)
+        await page.goto(url, wait_until="networkidle", timeout=45000)
+        # Give React time to hydrate, then query anchors
+        await page.wait_for_timeout(300)  # small safety delay
+
+        anchors = await page.query_selector_all("a[href*='/players/'][href*='/25-']")
+        raw: List[Dict[str, str]] = []
+        for a in anchors:
+            href = (await a.get_attribute("href")) or ""
+            path = urlparse(href).path
+            m = PLAYER_ANCHOR_RE.search(path or "")
+            if not m:
+                continue
+            code = normalize_version_id(m.group(1))
+            text = (await a.inner_text()) or path
+            raw.append({"name": text.strip(), "href": path, "variant_code": code})
+
+        # de-dup by variant_code, preserve order
+        out, seen = [], set()
+        for p in raw:
+            vc = p["variant_code"]
+            if vc and vc not in seen:
+                out.append(p); seen.add(vc)
+        return out
+    finally:
+        await context.close()
+
+async def parse_solution_players(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
+    """
+    Public API: try fast HTTP parse first; if nothing found, fall back to headless browser.
+    Always returns players from anchors like /players/.../25-<digits>/ with digits-only codes.
+    """
+    players = await _parse_solution_players_http(session, solution_url)
+    if players:
+        return players
+    # Fallback to browser render
+    return await _parse_solution_players_browser(solution_url)
