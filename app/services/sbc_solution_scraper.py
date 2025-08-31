@@ -30,15 +30,21 @@ class SbcEntry:
 _COINS_RE = re.compile(r"([\d,]+)\s*(?:Image:\s*)?(?:FC\s*Coin|Coins?)", re.IGNORECASE)
 
 # Player links look like /players/<id>-<slug>/25-<variant>[/]
-# (Allow optional name segment and optional trailing slash; path is parsed from absolute URLs too)
 _PLAYER_LINK_RE = re.compile(r"^/players/\d+(?:-[^/]+)?/25-(\d+)(?:/|$)")
 
 # Squad-builder UUID present in /25/squad-builder/<uuid>[/]
 _SQUAD_BUILDER_PATH_RE = re.compile(r"/(?:\d+/)?squad-builder/([0-9a-fA-F-]{12,})/?")
 
+# Fallback: capture any “…25-<digits>…” anywhere in text
+_VARIANT_IN_TEXT_RE = re.compile(r"(?:^|[^0-9])25-(\d+)(?:/|[^0-9]|$)")
+
 # ---------- Tiny utils ----------
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
+def normalize_version_id(code: str | int | None) -> str:
+    """Digits-only version of any code; strips '25-' and anything non-numeric."""
+    return re.sub(r"\D", "", str(code or ""))
 
 async def _fetch(session: aiohttp.ClientSession, url: str) -> str:
     headers = {
@@ -89,8 +95,7 @@ async def list_sbc_player_slugs(session: aiohttp.ClientSession, index_url: str =
     seen, out = set(), []
     for s in slugs:
         if s not in seen:
-            out.append(s)
-            seen.add(s)
+            out.append(s); seen.add(s)
     return out
 
 # ---------- Public: parse a single SBC page ----------
@@ -98,10 +103,6 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
     """
     Extract challenge blocks and reliably find 'View Solution' anchors like:
       <a href="/25/squad-builder/<uuid>/"><span>View Solution</span>...</a>
-    Strategy:
-      - Find headers (h2–h5)
-      - Walk forward until the next header
-      - For each <a>, use _is_view_solution_anchor()
     """
     url = slug if slug.startswith("http") else f"{FUTGG_BASE}/sbc/{slug}"
     html = await _fetch(session, url)
@@ -115,8 +116,8 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
 
     for i, header in enumerate(headers):
         name = header.get_text(" ", strip=True)
-        # Skip the hero/summary header that equals the page title
-        if name.strip().lower() == title.strip().lower():
+        # Skip hero header equal to page title
+        if name.strip().lower() == (title or "").strip().lower():
             continue
 
         next_header = headers[i + 1] if i + 1 < len(headers) else None
@@ -151,7 +152,7 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
                 )
             )
 
-    # Fallback: map any global /squad-builder/ anchors to nearest header
+    # Fallback: map global /squad-builder/ anchors to nearest header
     if not any(c.view_solution_url for c in challenges):
         for a in soup.find_all("a", href=True):
             if _is_view_solution_anchor(a):
@@ -189,6 +190,16 @@ def _walk(obj: Any):
     else:
         yield obj
 
+def _dedup_and_normalize(players: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    out, seen = [], set()
+    for p in players:
+        v = normalize_version_id(p.get("variant_code"))
+        if not v or v in seen:
+            continue
+        p["variant_code"] = v
+        out.append(p); seen.add(v)
+    return out
+
 def _extract_players_from_soup(soup: BeautifulSoup) -> List[Dict[str, str]]:
     players: List[Dict[str, str]] = []
     for a in soup.find_all("a", href=True):
@@ -197,21 +208,8 @@ def _extract_players_from_soup(soup: BeautifulSoup) -> List[Dict[str, str]]:
             name = a.get_text(" ", strip=True)
             code = extract_variant_code_from_href(path)
             if code:
-                pos = ""
-                parent = a.find_parent()
-                if parent:
-                    cls = " ".join(parent.get("class", []))
-                    m = re.search(r"\b(GK|LB|CB|RB|LWB|RWB|CDM|CM|CAM|LM|RM|LW|RW|ST|CF)\b", cls)
-                    if m:
-                        pos = m.group(1)
-                players.append({"name": name or path, "href": path, "variant_code": code, "position": pos})
-    # de-dup
-    out, seen = [], set()
-    for p in players:
-        if p["variant_code"] not in seen:
-            out.append(p)
-            seen.add(p["variant_code"])
-    return out
+                players.append({"name": name or path, "href": path, "variant_code": code, "position": ""})
+    return _dedup_and_normalize(players)
 
 def _extract_players_from_any_strings(data: Dict[str, Any]) -> List[Dict[str, str]]:
     found: List[Dict[str, str]] = []
@@ -221,18 +219,12 @@ def _extract_players_from_any_strings(data: Dict[str, Any]) -> List[Dict[str, st
             if path.startswith("/players/"):
                 code = extract_variant_code_from_href(path)
                 if code:
+                    # name fallback from slug
                     segs = path.strip("/").split("/")
-                    # rough guess: turn slug into a readable name
                     name_guess = segs[1].split("-")[1:] if len(segs) > 1 else []
                     name = " ".join(s.capitalize() for s in name_guess) or path
                     found.append({"name": name, "href": path, "variant_code": code, "position": ""})
-    # de-dup
-    out, seen = [], set()
-    for p in found:
-        if p["variant_code"] not in seen:
-            out.append(p)
-            seen.add(p["variant_code"])
-    return out
+    return _dedup_and_normalize(found)
 
 def _extract_players_from_nextdata_json(data: Dict[str, Any]) -> List[Dict[str, str]]:
     # 1) Dict-shaped items with href/slug/link/url
@@ -254,14 +246,7 @@ def _extract_players_from_nextdata_json(data: Dict[str, Any]) -> List[Dict[str, 
                         })
     # 2) Bare strings containing player paths
     candidates += _extract_players_from_any_strings(data)
-
-    # de-dup preserve order
-    out, seen = [], set()
-    for p in candidates:
-        if p["variant_code"] not in seen:
-            out.append(p)
-            seen.add(p["variant_code"])
-    return out
+    return _dedup_and_normalize(candidates)
 
 async def _try_nextdata_endpoint(session: aiohttp.ClientSession, html: str, solution_url: str) -> List[Dict[str, str]]:
     soup = BeautifulSoup(html, "html.parser")
@@ -273,12 +258,12 @@ async def _try_nextdata_endpoint(session: aiohttp.ClientSession, html: str, solu
     except Exception:
         return []
 
-    # First, scan the embedded JSON
+    # Scan the embedded JSON first
     prime = _extract_players_from_nextdata_json(nextdata)
     if prime:
         return prime
 
-    # Try the _next/data/<buildId>/... json page
+    # Try the _next/data/<buildId>/... JSON route
     build_id = nextdata.get("buildId")
     if not isinstance(build_id, str) or not build_id:
         return []
@@ -307,8 +292,23 @@ async def _try_nextdata_endpoint(session: aiohttp.ClientSession, html: str, solu
     except Exception:
         return []
 
+def _extract_variant_codes_from_text(text: str) -> List[str]:
+    codes = [normalize_version_id(m.group(1)) for m in _VARIANT_IN_TEXT_RE.finditer(text or "")]
+    # de-dup preserve order
+    seen, out = set(), []
+    for c in codes:
+        if c and c not in seen:
+            out.append(c); seen.add(c)
+    return out
+
 async def parse_solution_players(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
-    """Open a squad-builder solution page and return players with variant_code (anchors → Next.js fallbacks)."""
+    """
+    Open a squad-builder solution page and return players with variant_code (digits only).
+    Extraction order:
+      1) Anchors in HTML
+      2) __NEXT_DATA__ (and _next/data/<buildId>/...json)
+      3) Raw text fallback: regex for '25-<variant>' anywhere
+    """
     solution_url = urljoin(FUTGG_BASE, solution_url)
     html = await _fetch(session, solution_url)
     soup = BeautifulSoup(html, "html.parser")
@@ -320,4 +320,10 @@ async def parse_solution_players(session: aiohttp.ClientSession, solution_url: s
 
     # B/C) Next.js fallbacks
     players = await _try_nextdata_endpoint(session, html, solution_url)
-    return players or []
+    if players:
+        return players
+
+    # D) Raw text fallback
+    codes = _extract_variant_codes_from_text(html)
+    players = [{"name": f"#{c}", "href": "", "variant_code": c, "position": ""} for c in codes]
+    return _dedup_and_normalize(players)
