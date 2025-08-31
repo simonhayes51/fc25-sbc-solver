@@ -1,0 +1,172 @@
+
+from __future__ import annotations
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional, List, Dict, Any
+import os
+import asyncpg
+import aiohttp
+
+from app.services.sbc_solution_scraper import (
+    list_sbc_player_slugs, parse_sbc_page, parse_solution_players
+)
+
+try:
+    from app.services.prices import get_player_price  # (player_id, platform) -> int
+except Exception:
+    async def get_player_price(player_id: int, platform: str = "ps") -> Optional[int]:
+        return None
+
+router = APIRouter(prefix="/api/sbc2", tags=["SBC2"])
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS sbc_sets (
+  slug TEXT PRIMARY KEY,
+  title TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sbc_challenges (
+  id SERIAL PRIMARY KEY,
+  set_slug TEXT NOT NULL REFERENCES sbc_sets(slug) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  coin_text TEXT,
+  block_text TEXT,
+  view_solution_url TEXT,
+  UNIQUE (set_slug, name)
+);
+CREATE TABLE IF NOT EXISTS sbc_challenge_players (
+  challenge_id INTEGER NOT NULL REFERENCES sbc_challenges(id) ON DELETE CASCADE,
+  variant_code TEXT NOT NULL,
+  name TEXT,
+  PRIMARY KEY (challenge_id, variant_code)
+);
+"""
+
+async def get_pool() -> asyncpg.Pool:
+    dsn = os.environ.get("DATABASE_URL")
+    if not dsn:
+        raise RuntimeError("DATABASE_URL not set")
+    return await asyncpg.create_pool(dsn, min_size=1, max_size=5)
+
+@router.post("/ingest/init-schema")
+async def init_schema():
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        await con.execute(SCHEMA_SQL)
+    await pool.close()
+    return {"ok": True}
+
+class IngestIn(BaseModel):
+    limit: Optional[int] = None
+
+@router.post("/ingest-all")
+async def ingest_all(payload: IngestIn):
+    async with aiohttp.ClientSession() as s:
+        slugs = await list_sbc_player_slugs(s)
+        if payload.limit: slugs = slugs[:payload.limit]
+        pool = await get_pool()
+        async with pool.acquire() as con:
+            await con.execute(SCHEMA_SQL)
+            for slug in slugs:
+                entry = await parse_sbc_page(s, slug)
+                await con.execute(
+                    "INSERT INTO sbc_sets (slug,title) VALUES ($1,$2) ON CONFLICT (slug) DO UPDATE SET title=$2",
+                    entry.slug, entry.title
+                )
+                for ch in entry.challenges:
+                    cid = await con.fetchval(
+                        """INSERT INTO sbc_challenges (set_slug,name,coin_text,block_text,view_solution_url)
+                           VALUES ($1,$2,$3,$4,$5)
+                           ON CONFLICT (set_slug,name) DO UPDATE SET coin_text=$3, block_text=$4, view_solution_url=$5
+                           RETURNING id""",
+                        entry.slug, ch.name, ch.coin_text, ch.block_text, ch.view_solution_url
+                    )
+                    players = []
+                    if ch.view_solution_url:
+                        try:
+                            players = await parse_solution_players(s, ch.view_solution_url)
+                        except Exception as e:
+                            players = [{"name":"ERROR","variant_code":str(e)}]
+                    for p in players:
+                        await con.execute(
+                            "INSERT INTO sbc_challenge_players (challenge_id,variant_code,name) VALUES ($1,$2,$3) ON CONFLICT (challenge_id,variant_code) DO NOTHING",
+                            cid, p.get("variant_code"), p.get("name")
+                        )
+    return {"ok": True, "ingested": len(slugs)}
+
+def format_coins(n: Optional[int]) -> str:
+    if n is None: return "—"
+    return f"{n:,}c"
+
+async def variant_code_to_player_id(con: asyncpg.Connection, code: str) -> Optional[int]:
+    row = await con.fetchrow("SELECT id FROM fut_players WHERE variant_code = $1 OR version_id::text = $1 LIMIT 1", code)
+    return row["id"] if row else None
+
+DEFAULT_SLOTS = [
+    (50, 92),  # GK
+    (18, 76), (39, 74), (61, 74), (82, 76),  # LB, LCB, RCB, RB
+    (30, 58), (50, 56), (70, 58),            # CM, CM, CM
+    (25, 36), (50, 32), (75, 36),            # LW, ST, RW
+]
+
+@router.get("/render", response_class=HTMLResponse)
+async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
+    async with aiohttp.ClientSession() as s:
+        entry = await parse_sbc_page(s, slug)
+        chall = next((c for c in entry.challenges if c.name.lower() == challenge.lower()), None)
+        if not chall:
+            raise HTTPException(404, f"Challenge '{challenge}' not found")
+        if not chall.view_solution_url:
+            raise HTTPException(404, "No View Solution URL on this challenge")
+        players = await parse_solution_players(s, chall.view_solution_url)
+
+    pool = await get_pool()
+    total = 0
+    cards = []
+    async with pool.acquire() as con:
+        # basic order to fill slots
+        ordered = players[:11]
+        for idx, p in enumerate(ordered):
+            code = p.get("variant_code")
+            pid = await variant_code_to_player_id(con, code) if code else None
+            price = await get_player_price(pid, platform=platform) if pid is not None else None
+            total += (price or 0)
+            name = p.get("name") or f"#{code}"
+            price_txt = format_coins(price)
+            x,y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50,50)
+            cards.append({"x":x,"y":y,"name":name,"price_txt":price_txt})
+
+    total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
+
+    # Build HTML
+    from html import escape
+    head = """
+<!doctype html>
+<html><head><meta charset='utf-8'><title>Pitch</title>
+<style>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0a1a0a;color:#fff;margin:0}
+.wrap{max-width:1080px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 8px}
+.subtitle{opacity:.8;margin-bottom:16px}
+.pitch{position:relative;width:100%;padding-top:62%;background:linear-gradient(#0f4d0f,#0b390b);border:2px solid #1f5f1f;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.3);margin-bottom:16px}
+.slot{position:absolute;width:12%;transform:translate(-50%,-50%);text-align:center}
+.card{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:6px 6px 8px}
+.name{font-size:12px;line-height:1.2;margin-top:4px}
+.price{font-size:12px;opacity:.9}
+.total{font-weight:700;font-size:16px;margin-top:8px}
+</style></head><body><div class='wrap'>
+"""
+    title_html = f"<h1>{escape(entry.title)} — {escape(challenge)}</h1>"
+    subtitle = f"<div class='subtitle'>{escape(chall.coin_text or '')}</div>"
+    pitch_open = "<div class='pitch'>"
+    slots_html = ""
+    for c in cards:
+        slots_html += f\"\"\"<div class='slot' style='left:{c["x"]}%;top:{c["y"]}%;'>
+  <div class='card'><div class='price'>{escape(c["price_txt"])}</div><div class='name'>{escape(c["name"])}</div></div>
+</div>\"\"\"
+    pitch_close = "</div>"
+    total_html = f"<div class='total'>Total: {escape(total_txt)}</div>"
+    foot = "</div></body></html>"
+
+    html = head + title_html + subtitle + pitch_open + slots_html + pitch_close + total_html + foot
+    return HTMLResponse(content=html, status_code=200)
