@@ -3,8 +3,7 @@ import re
 import json
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Any
-import urllib.parse as _url
-
+from urllib.parse import urljoin, urlparse
 import aiohttp
 from bs4 import BeautifulSoup
 
@@ -23,11 +22,11 @@ class SbcEntry:
     title: str
     challenges: List[ChallengeBlock]
 
-# tolerant coin matcher (handles "Image: FC Coin" artifacts)
+# tolerant coin matcher (handles “Image: FC Coin” artifacts)
 _COINS_RE = re.compile(r"([\d,]+)\s*(?:Image:\s*)?(?:FC\s*Coin|Coins?)", re.IGNORECASE)
 # variant code in href like /players/247515-john-barnes/25-67356379/
 _PLAYER_LINK_RE = re.compile(r'^/players/\d+-[^/]+/25-(\d+)/')
-# squad builder URL parts
+# squad builder UUID in path
 _SQUAD_BUILDER_PATH_RE = re.compile(r'/(?:\d+/)?squad-builder/([0-9a-fA-F-]{12,})/?')
 
 def _clean(s: str) -> str:
@@ -51,6 +50,21 @@ async def _fetch(session: aiohttp.ClientSession, url: str) -> str:
         resp.raise_for_status()
         return await resp.text()
 
+def _is_view_solution_anchor(a) -> bool:
+    """True for anchors that are 'View Solution' buttons (text or icon), or any /squad-builder/ href."""
+    if not a or not a.has_attr("href"):
+        return False
+    href = a["href"] or ""
+    if "/squad-builder/" in href:
+        return True
+    txt = (a.get_text(" ", strip=True) or "").lower()
+    if "view solution" in txt:
+        return True
+    for sp in a.find_all("span"):
+        if "view solution" in (sp.get_text(" ", strip=True) or "").lower():
+            return True
+    return False
+
 async def list_sbc_player_slugs(session: aiohttp.ClientSession, index_url: str = f"{FUTGG_BASE}/sbc/") -> List[str]:
     html = await _fetch(session, index_url)
     soup = BeautifulSoup(html, "html.parser")
@@ -71,8 +85,12 @@ async def list_sbc_player_slugs(session: aiohttp.ClientSession, index_url: str =
 
 async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
     """
-    Open an SBC set page, extract challenge blocks and their View Solution links.
-    Robust to icon-only links by matching '/squad-builder/' in href.
+    Extract challenge blocks and reliably find 'View Solution' anchors like:
+      <a href="/25/squad-builder/<uuid>/"><span>View Solution</span>...</a>
+    Strategy:
+      - Find headers (h2–h5)
+      - Walk forward until the next header
+      - For each <a>, use _is_view_solution_anchor()
     """
     url = slug if slug.startswith("http") else f"{FUTGG_BASE}/sbc/{slug}"
     html = await _fetch(session, url)
@@ -81,36 +99,54 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
     title_el = soup.find("h1")
     title = title_el.get_text(strip=True) if title_el else "SBC"
 
+    headers = soup.find_all(["h2", "h3", "h4", "h5"])
     challenges: List[ChallengeBlock] = []
-    for header in soup.find_all(["h3", "h4", "h5"]):
-        name = header.get_text(" ", strip=True)
-        # collect siblings until next header
-        nodes, nxt = [], header.find_next_sibling()
-        while nxt and nxt.name not in ["h3", "h4", "h5"]:
-            nodes.append(nxt)
-            nxt = nxt.find_next_sibling()
 
-        block_text = _clean(" ".join(n.get_text(" ", strip=True) for n in nodes if hasattr(n, "get_text")))
+    for i, header in enumerate(headers):
+        name = header.get_text(" ", strip=True)
+        next_header = headers[i + 1] if i + 1 < len(headers) else None
+
+        view_solution_url: Optional[str] = None
+        text_parts: List[str] = []
+
+        for node in header.next_elements:
+            if node is header:
+                continue
+            if next_header is not None and node is next_header:
+                break
+
+            if getattr(node, "name", None) in {"p", "li", "div", "span", "strong", "em", "ul", "ol"}:
+                text_parts.append(node.get_text(" ", strip=True))
+
+            if getattr(node, "name", None) == "a" and node.has_attr("href"):
+                if _is_view_solution_anchor(node):
+                    view_solution_url = urljoin(FUTGG_BASE, node["href"])
+
+        block_text = _clean(" ".join(text_parts))
         m = _COINS_RE.search(block_text or "")
         coin_text = m.group(1) if m else None
 
-        # robust solution-link detection (text OR href match)
-        view_solution_url = None
-        for n in nodes:
-            for a in getattr(n, "find_all", lambda *a, **k: [])("a", href=True):
-                txt = (a.get_text(strip=True) or "").lower()
-                href = a["href"]
-                if ("solution" in txt) or ("/squad-builder/" in href):
-                    view_solution_url = href if href.startswith("http") else (FUTGG_BASE + href)
-                    break
-            if view_solution_url:
-                break
-
-        # keep likely challenge blocks even if no solution link (requirements-only)
         if view_solution_url or "min." in (block_text or "").lower() or "rated squad" in (name or "").lower():
-            challenges.append(ChallengeBlock(
-                name=name, coin_text=coin_text, block_text=block_text, view_solution_url=view_solution_url
-            ))
+            challenges.append(
+                ChallengeBlock(
+                    name=name,
+                    coin_text=coin_text,
+                    block_text=block_text,
+                    view_solution_url=view_solution_url,
+                )
+            )
+
+    # Fallback: if zero links found, try a global scan to map any squad-builder links to nearest header
+    if not any(c.view_solution_url for c in challenges):
+        for a in soup.find_all("a", href=True):
+            if _is_view_solution_anchor(a):
+                prev_header = a.find_previous(["h2", "h3", "h4", "h5"])
+                if prev_header:
+                    target = prev_header.get_text(" ", strip=True)
+                    for c in challenges:
+                        if c.name == target and not c.view_solution_url:
+                            c.view_solution_url = urljoin(FUTGG_BASE, a["href"])
+                            break
 
     return SbcEntry(slug=slug.strip("/"), title=title, challenges=challenges)
 
@@ -119,7 +155,6 @@ def extract_variant_code_from_href(href: str) -> Optional[str]:
     return m.group(1) if m else None
 
 def _walk(obj: Any):
-    """Yield every node in a nested dict/list structure."""
     if isinstance(obj, dict):
         for v in obj.values():
             yield from _walk(v)
@@ -175,10 +210,6 @@ def _extract_players_from_nextdata_json(data: Dict[str, Any]) -> List[Dict[str, 
     return out
 
 async def _try_nextdata_endpoint(session: aiohttp.ClientSession, html: str, solution_url: str) -> List[Dict[str, str]]:
-    """
-    If buildId is present in __NEXT_DATA__, try the JSON data route:
-      /_next/data/<buildId>/25/squad-builder/<uuid>.json
-    """
     soup = BeautifulSoup(html, "html.parser")
     script = soup.find("script", id="__NEXT_DATA__", type="application/json")
     if not script or not script.string:
@@ -188,22 +219,22 @@ async def _try_nextdata_endpoint(session: aiohttp.ClientSession, html: str, solu
     except Exception:
         return []
 
-    # Extract buildId
     build_id = nextdata.get("buildId")
+    # First, see if __NEXT_DATA__ already contains player links
+    prime = _extract_players_from_nextdata_json(nextdata)
+    if prime:
+        return prime
+
     if not isinstance(build_id, str) or not build_id:
-        # still try to scan the JSON we already have
-        return _extract_players_from_nextdata_json(nextdata)
+        return []
 
-    # Need the UUID from the URL
-    m = _SQUAD_BUILDER_PATH_RE.search(_url.urlparse(solution_url).path)
+    m = _SQUAD_BUILDER_PATH_RE.search(urlparse(solution_url).path)
     if not m:
-        return _extract_players_from_nextdata_json(nextdata)
-    uuid = m.group(1)
+        return []
 
-    # Attempt the data JSON
-    # FUT.GG tends to mount under /25/squad-builder/<uuid>
+    uuid = m.group(1)
     path_guess = f"/_next/data/{build_id}/25/squad-builder/{uuid}.json"
-    json_url = _url.urljoin(FUTGG_BASE, path_guess)
+    json_url = urljoin(FUTGG_BASE, path_guess)
 
     try:
         headers = {
@@ -217,28 +248,21 @@ async def _try_nextdata_endpoint(session: aiohttp.ClientSession, html: str, solu
         timeout = aiohttp.ClientTimeout(total=25)
         async with session.get(json_url, headers=headers, timeout=timeout) as resp:
             if resp.status != 200:
-                # fall back to scanning __NEXT_DATA__ we already parsed
-                return _extract_players_from_nextdata_json(nextdata)
+                return []
             data = await resp.json()
         return _extract_players_from_nextdata_json(data)
     except Exception:
-        return _extract_players_from_nextdata_json(nextdata)
+        return []
 
 async def parse_solution_players(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
-    """
-    Open a squad-builder solution page and return players with variant_code.
-    1) Try anchors in HTML
-    2) Fallback to __NEXT_DATA__
-    3) Fallback to _next/data/<buildId>/...json
-    """
+    """Open a squad-builder solution page and return players with variant_code (anchors → Next.js fallbacks)."""
+    solution_url = urljoin(FUTGG_BASE, solution_url)
     html = await _fetch(session, solution_url)
     soup = BeautifulSoup(html, "html.parser")
 
-    # A) anchor path
     players = _extract_players_from_soup(soup)
     if players:
         return players
 
-    # B/C) Next.js JSON fallbacks
     players = await _try_nextdata_endpoint(session, html, solution_url)
     return players or []
