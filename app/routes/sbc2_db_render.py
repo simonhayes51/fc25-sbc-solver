@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from html import escape
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 import asyncpg
@@ -59,11 +59,30 @@ async def get_pool() -> asyncpg.Pool:
 def format_coins(n: Optional[int]) -> str:
     return "—" if n is None else f"{n:,}c"
 
+def _normalize_image_url(url: Optional[str]) -> Optional[str]:
+    """
+    Normalize FUT.GG image URLs by stripping CF '/cdn-cgi/image/<opts>/'.
+    e.g. https://game-assets.fut.gg/cdn-cgi/image/quality=100,.../2025/player-item/25-xxxx.webp
+      -> https://game-assets.fut.gg/2025/player-item/25-xxxx.webp
+    """
+    if not url:
+        return None
+    u = url.split("?", 1)[0]
+    try:
+        p = urlparse(u)
+        path = p.path
+        idx = path.find("/cdn-cgi/image/")
+        if idx != -1:
+            # find '/202' (year) segment after the transform prefix
+            j = path.find("/202", idx)
+            if j != -1:
+                path = path[j:]
+                u = f"{p.scheme}://{p.netloc}{path}"
+    except Exception:
+        pass
+    return u
+
 async def lookup_player_by_card_id(con: asyncpg.Connection, version_code: str) -> tuple[Optional[int], Optional[str]]:
-    """
-    Map digits-only variant/version id to fut_players.card_id.
-    Returns (player_id, display_name).
-    """
     v = normalize_version_id(version_code)
     if not v:
         return None, None
@@ -72,6 +91,28 @@ async def lookup_player_by_card_id(con: asyncpg.Connection, version_code: str) -
         return None, None
     name = row.get("name") or row.get("full_name") or row.get("common_name")
     return row["id"], name
+
+async def lookup_player_by_image_url(con: asyncpg.Connection, img_url: Optional[str]) -> tuple[Optional[int], Optional[str]]:
+    if not img_url:
+        return None, None
+    # try exact, then normalized, then path LIKE
+    candidates: List[str] = []
+    norm = _normalize_image_url(img_url)
+    candidates.append(img_url)
+    if norm and norm != img_url:
+        candidates.append(norm)
+    for cand in candidates:
+        row = await con.fetchrow("SELECT id, name FROM fut_players WHERE image_url = $1 LIMIT 1", cand)
+        if row:
+            name = row.get("name") or row.get("full_name") or row.get("common_name")
+            return row["id"], name
+    if norm:
+        path_only = urlparse(norm).path
+        row = await con.fetchrow("SELECT id, name FROM fut_players WHERE image_url ILIKE '%' || $1 LIMIT 1", path_only)
+        if row:
+            name = row.get("name") or row.get("full_name") or row.get("common_name")
+            return row["id"], name
+    return None, None
 
 # Simple 4-4-2-ish slots
 DEFAULT_SLOTS = [
@@ -82,7 +123,7 @@ DEFAULT_SLOTS = [
 ]
 
 def _render_pitch_html(title: str, subtitle: str, cards: List[Dict[str, Any]], total_txt: str) -> str:
-    slots_html = "".join(
+    slots_html = "".48join(
         f"<div class='slot' style='left:{c['x']}%;top:{c['y']}%;'>"
         f"<div class='card'><div class='price'>{escape(c['price_txt'])}</div>"
         f"<div class='name'>{escape(c['name'])}</div></div></div>"
@@ -143,7 +184,7 @@ async def ingest_all(payload: IngestIn):
                         "ON CONFLICT (slug) DO UPDATE SET title=$2",
                         entry.slug, entry.title
                     )
-                    # challenges & players (anchor-only)
+                    # challenges & players
                     for ch in entry.challenges:
                         cid = await con.fetchval(
                             """INSERT INTO sbc_challenges (set_slug,name,coin_text,block_text,view_solution_url)
@@ -214,7 +255,7 @@ async def sbc_challenges(path: str):
 async def sbc_challenges_alias(path: str):
     return await sbc_challenges(path)
 
-# Debug: show parsed players (anchor-only)
+# Debug: show parsed players (now includes image_url if present)
 @router.get("/debug/solution-players")
 async def debug_solution_players(solution_url: str):
     solution_url = urljoin("https://www.fut.gg", solution_url)
@@ -223,8 +264,43 @@ async def debug_solution_players(solution_url: str):
     return {
         "count": len(players),
         "variant_codes": [normalize_version_id(p.get("variant_code")) for p in players],
+        "image_samples": [p.get("image_url") for p in players[:11]],
         "sample": players[:11],
     }
+
+# -------- Shared render core with image_url fallback --------
+async def _render_from_solution_url(solution_url: str, platform: str = "ps") -> str:
+    solution_url = urljoin("https://www.fut.gg", solution_url)
+    async with aiohttp.ClientSession() as s:
+        players = await parse_solution_players(s, solution_url)
+
+    if not players:
+        raise HTTPException(502, "Could not extract any players from the solution page.")
+
+    pool = await get_pool()
+    total = 0
+    cards: List[Dict[str, Any]] = []
+    async with pool.acquire() as con:
+        ordered = players[:11]
+        for idx, p in enumerate(ordered):
+            code = normalize_version_id(p.get("variant_code"))
+            pid, dbname = (None, None)
+            if code:
+                pid, dbname = await lookup_player_by_card_id(con, code)
+            if pid is None:
+                pid, dbname = await lookup_player_by_image_url(con, p.get("image_url"))
+
+            price = await get_player_price(pid, platform=platform) if pid is not None else None
+            total += (price or 0)
+
+            display_name = p.get("name") or dbname or (f"#{code}" if code else "[img]")
+            price_txt = format_coins(price)
+            x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
+            cards.append({"x": x, "y": y, "name": display_name, "price_txt": price_txt})
+
+    total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
+    html = _render_pitch_html("Solution Pitch", "", cards, total_txt)
+    return HTMLResponse(content=html, status_code=200)
 
 # Render by SBC slug + challenge name
 @router.get("/render", response_class=HTMLResponse)
@@ -250,64 +326,12 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
         if not chall.view_solution_url:
             raise HTTPException(404, "No View Solution URL on this challenge")
 
-        players = await parse_solution_players(s, chall.view_solution_url)
-
-    if not players:
-        raise HTTPException(
-            status_code=502,
-            detail="No /players/.../25-<digits>/ anchors found on the solution page."
-        )
-
-    pool = await get_pool()
-    total = 0
-    cards: List[Dict[str, Any]] = []
-    async with pool.acquire() as con:
-        ordered = players[:11]
-        for idx, p in enumerate(ordered):
-            code = normalize_version_id(p.get("variant_code"))
-            pid, dbname = await lookup_player_by_card_id(con, code)
-            price = await get_player_price(pid, platform=platform) if pid is not None else None
-            total += (price or 0)
-            name = (p.get("name") or dbname or f"#{code}")
-            price_txt = format_coins(price)
-            x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
-            cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
-
-    total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
-    html = _render_pitch_html(f"{slug} — {challenge}", "", cards, total_txt)
-    return HTMLResponse(content=html, status_code=200)
+        return await _render_from_solution_url(chall.view_solution_url, platform=platform)
 
 # Render directly from a squad-builder URL (accepts relative or absolute)
 @router.get("/render-by-url", response_class=HTMLResponse)
 async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
-    solution_url = urljoin("https://www.fut.gg", solution_url)
-    async with aiohttp.ClientSession() as s:
-        players = await parse_solution_players(s, solution_url)
-
-    if not players:
-        raise HTTPException(
-            status_code=502,
-            detail="No /players/.../25-<digits>/ anchors found on the solution page."
-        )
-
-    pool = await get_pool()
-    total = 0
-    cards: List[Dict[str, Any]] = []
-    async with pool.acquire() as con:
-        ordered = players[:11]
-        for idx, p in enumerate(ordered):
-            code = normalize_version_id(p.get("variant_code"))
-            pid, dbname = await lookup_player_by_card_id(con, code)
-            price = await get_player_price(pid, platform=platform) if pid is not None else None
-            total += (price or 0)
-            name = (p.get("name") or dbname or f"#{code}")
-            price_txt = format_coins(price)
-            x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
-            cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
-
-    total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
-    html = _render_pitch_html("Solution Pitch", "", cards, total_txt)
-    return HTMLResponse(content=html, status_code=200)
+    return await _render_from_solution_url(solution_url, platform=platform)
 
 # Optional: schema peek
 @router.get("/debug/schema")
