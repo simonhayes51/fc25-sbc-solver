@@ -26,17 +26,14 @@ class SbcEntry:
     challenges: List[ChallengeBlock]
 
 # ---------- Regex helpers ----------
-# Tolerant matcher for coin text (handles "Image: FC Coin" artifacts)
 _COINS_RE = re.compile(r"([\d,]+)\s*(?:Image:\s*)?(?:FC\s*Coin|Coins?)", re.IGNORECASE)
-
-# Player links look like /players/<id>-<slug>/25-<variant>[/]
 _PLAYER_LINK_RE = re.compile(r"^/players/\d+(?:-[^/]+)?/25-(\d+)(?:/|$)")
-
-# Squad-builder UUID present in /25/squad-builder/<uuid>[/]
 _SQUAD_BUILDER_PATH_RE = re.compile(r"/(?:\d+/)?squad-builder/([0-9a-fA-F-]{12,})/?")
 
-# Fallback: capture any “…25-<digits>…” anywhere in text
+# Fallback finders
 _VARIANT_IN_TEXT_RE = re.compile(r"(?:^|[^0-9])25-(\d+)(?:/|[^0-9]|$)")
+# Broad numeric finder (7–9 digits; covers typical EA/FUT version/card IDs)
+_DIGIT_WINDOW_RE = re.compile(r"(?<!\d)(\d{7,9})(?!\d)")
 
 # ---------- Tiny utils ----------
 def _clean(s: str) -> str:
@@ -63,6 +60,11 @@ async def _fetch(session: aiohttp.ClientSession, url: str) -> str:
     async with session.get(url, headers=headers, timeout=timeout) as resp:
         resp.raise_for_status()
         return await resp.text()
+
+async def fetch_solution_html(session: aiohttp.ClientSession, solution_url: str) -> str:
+    """Public helper so routes can fetch the raw HTML for DB-verified fallbacks."""
+    solution_url = urljoin(FUTGG_BASE, solution_url)
+    return await _fetch(session, solution_url)
 
 def _is_view_solution_anchor(a) -> bool:
     """True for anchors that act as 'View Solution' buttons (text or icon), or any /squad-builder/ href."""
@@ -292,13 +294,26 @@ async def _try_nextdata_endpoint(session: aiohttp.ClientSession, html: str, solu
     except Exception:
         return []
 
-def _extract_variant_codes_from_text(text: str) -> List[str]:
-    codes = [normalize_version_id(m.group(1)) for m in _VARIANT_IN_TEXT_RE.finditer(text or "")]
-    # de-dup preserve order
-    seen, out = set(), []
-    for c in codes:
+def extract_candidate_card_ids_from_text(text: str, max_ids: int = 200) -> List[str]:
+    """
+    Find plausible digits-only card/version IDs in raw HTML/JSON text:
+      - 25-<digits>
+      - any 7–9 digit numbers (later validated against DB)
+    """
+    candidates: List[str] = []
+    # 25-<digits>
+    for m in _VARIANT_IN_TEXT_RE.finditer(text or ""):
+        candidates.append(normalize_version_id(m.group(1)))
+    # Broad 7–9 digit sequences
+    for m in _DIGIT_WINDOW_RE.finditer(text or ""):
+        candidates.append(normalize_version_id(m.group(1)))
+    # de-dup preserve order, cap
+    out, seen = [], set()
+    for c in candidates:
         if c and c not in seen:
             out.append(c); seen.add(c)
+        if len(out) >= max_ids:
+            break
     return out
 
 async def parse_solution_players(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
@@ -307,7 +322,7 @@ async def parse_solution_players(session: aiohttp.ClientSession, solution_url: s
     Extraction order:
       1) Anchors in HTML
       2) __NEXT_DATA__ (and _next/data/<buildId>/...json)
-      3) Raw text fallback: regex for '25-<variant>' anywhere
+      3) (routes will optionally use DB-verified raw-text fallback if still 0)
     """
     solution_url = urljoin(FUTGG_BASE, solution_url)
     html = await _fetch(session, solution_url)
@@ -323,7 +338,5 @@ async def parse_solution_players(session: aiohttp.ClientSession, solution_url: s
     if players:
         return players
 
-    # D) Raw text fallback
-    codes = _extract_variant_codes_from_text(html)
-    players = [{"name": f"#{c}", "href": "", "variant_code": c, "position": ""} for c in codes]
-    return _dedup_and_normalize(players)
+    # D) No players here; routes may use fetch_solution_html + DB verification
+    return []
