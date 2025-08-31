@@ -4,6 +4,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import os
+
 import asyncpg
 import aiohttp
 from html import escape
@@ -12,7 +13,7 @@ from app.services.sbc_solution_scraper import (
     list_sbc_player_slugs, parse_sbc_page, parse_solution_players
 )
 
-# price service (fallback stub if not present)
+# Price service: if you don't have it yet, this stub returns None
 try:
     from app.services.prices import get_player_price  # (player_id, platform) -> int
 except Exception:
@@ -21,7 +22,7 @@ except Exception:
 
 router = APIRouter(prefix="/api/sbc2", tags=["SBC2"])
 
-# ---------- DB ----------
+# ---------------- DB ----------------
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sbc_sets (
   slug TEXT PRIMARY KEY,
@@ -50,13 +51,12 @@ async def get_pool() -> asyncpg.Pool:
         raise RuntimeError("DATABASE_URL not set")
     return await asyncpg.create_pool(dsn, min_size=1, max_size=5)
 
-# ---------- helpers ----------
 def format_coins(n: Optional[int]) -> str:
     if n is None: return "—"
     return f"{n:,}c"
 
 async def variant_code_to_player_id(con: asyncpg.Connection, code: str) -> Optional[int]:
-    # CHANGE THIS to match your schema/columns
+    # 👇 change these columns to match your schema (variant/version id)
     row = await con.fetchrow(
         "SELECT id FROM fut_players WHERE variant_code = $1 OR version_id::text = $1 LIMIT 1",
         code
@@ -99,7 +99,8 @@ h1{{font-size:20px;margin:0 0 8px}}
 <div class='total'>Total: {escape(total_txt)}</div>
 </div></body></html>"""
 
-# ---------- routes ----------
+# -------------- routes --------------
+
 @router.post("/ingest/init-schema")
 async def init_schema():
     pool = await get_pool()
@@ -124,11 +125,13 @@ async def ingest_all(payload: IngestIn):
                 await con.execute(SCHEMA_SQL)
                 for slug in slugs:
                     entry = await parse_sbc_page(s, slug)
+                    # sets
                     await con.execute(
                         "INSERT INTO sbc_sets (slug,title) VALUES ($1,$2) "
                         "ON CONFLICT (slug) DO UPDATE SET title=$2",
                         entry.slug, entry.title
                     )
+                    # challenges
                     for ch in entry.challenges:
                         cid = await con.fetchval(
                             """INSERT INTO sbc_challenges (set_slug,name,coin_text,block_text,view_solution_url)
@@ -138,6 +141,7 @@ async def ingest_all(payload: IngestIn):
                                RETURNING id""",
                             entry.slug, ch.name, ch.coin_text, ch.block_text, ch.view_solution_url
                         )
+                        # solution players (if a link exists)
                         if ch.view_solution_url:
                             try:
                                 players = await parse_solution_players(s, ch.view_solution_url)
@@ -154,7 +158,7 @@ async def ingest_all(payload: IngestIn):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
 
-# Convenience GET wrappers (clickable in browser)
+# Convenient GET wrappers (clickable from browser)
 @router.get("/ingest/init-schema")
 async def init_schema_get():
     return await init_schema()
@@ -208,7 +212,7 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
 
     pool = await get_pool()
     total = 0
-    cards = []
+    cards: List[Dict[str, Any]] = []
     async with pool.acquire() as con:
         ordered = players[:11]
         for idx, p in enumerate(ordered):
@@ -233,7 +237,7 @@ async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
 
     pool = await get_pool()
     total = 0
-    cards = []
+    cards: List[Dict[str, Any]] = []
     async with pool.acquire() as con:
         ordered = players[:11]
         for idx, p in enumerate(ordered):
@@ -249,3 +253,22 @@ async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
     total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
     html = _render_pitch_html("Solution Pitch", "", cards, total_txt)
     return HTMLResponse(content=html, status_code=200)
+
+# Optional: schema peek to confirm columns
+@router.get("/debug/schema")
+async def debug_schema():
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        async def cols(table):
+            rows = await con.fetch("""
+                SELECT column_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema='public' AND table_name=$1
+                ORDER BY ordinal_position
+            """, table)
+            return [dict(r) for r in rows]
+        return {
+            "sbc_sets": await cols("sbc_sets"),
+            "sbc_challenges": await cols("sbc_challenges"),
+            "sbc_challenge_players": await cols("sbc_challenge_players"),
+        }
