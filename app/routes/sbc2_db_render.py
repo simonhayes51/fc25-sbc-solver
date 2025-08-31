@@ -1,9 +1,8 @@
-
 from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional
 import os
 import asyncpg
 import aiohttp
@@ -63,21 +62,24 @@ class IngestIn(BaseModel):
 async def ingest_all(payload: IngestIn):
     async with aiohttp.ClientSession() as s:
         slugs = await list_sbc_player_slugs(s)
-        if payload.limit: slugs = slugs[:payload.limit]
+        if payload.limit:
+            slugs = slugs[:payload.limit]
         pool = await get_pool()
         async with pool.acquire() as con:
             await con.execute(SCHEMA_SQL)
             for slug in slugs:
                 entry = await parse_sbc_page(s, slug)
                 await con.execute(
-                    "INSERT INTO sbc_sets (slug,title) VALUES ($1,$2) ON CONFLICT (slug) DO UPDATE SET title=$2",
+                    "INSERT INTO sbc_sets (slug,title) VALUES ($1,$2) "
+                    "ON CONFLICT (slug) DO UPDATE SET title=$2",
                     entry.slug, entry.title
                 )
                 for ch in entry.challenges:
                     cid = await con.fetchval(
                         """INSERT INTO sbc_challenges (set_slug,name,coin_text,block_text,view_solution_url)
                            VALUES ($1,$2,$3,$4,$5)
-                           ON CONFLICT (set_slug,name) DO UPDATE SET coin_text=$3, block_text=$4, view_solution_url=$5
+                           ON CONFLICT (set_slug,name) DO UPDATE 
+                             SET coin_text=$3, block_text=$4, view_solution_url=$5
                            RETURNING id""",
                         entry.slug, ch.name, ch.coin_text, ch.block_text, ch.view_solution_url
                     )
@@ -86,20 +88,26 @@ async def ingest_all(payload: IngestIn):
                         try:
                             players = await parse_solution_players(s, ch.view_solution_url)
                         except Exception as e:
-                            players = [{"name":"ERROR","variant_code":str(e)}]
+                            players = [{"name": "ERROR", "variant_code": str(e)}]
                     for p in players:
                         await con.execute(
-                            "INSERT INTO sbc_challenge_players (challenge_id,variant_code,name) VALUES ($1,$2,$3) ON CONFLICT (challenge_id,variant_code) DO NOTHING",
+                            """INSERT INTO sbc_challenge_players (challenge_id,variant_code,name) 
+                               VALUES ($1,$2,$3) 
+                               ON CONFLICT (challenge_id,variant_code) DO NOTHING""",
                             cid, p.get("variant_code"), p.get("name")
                         )
     return {"ok": True, "ingested": len(slugs)}
 
 def format_coins(n: Optional[int]) -> str:
-    if n is None: return "—"
+    if n is None:
+        return "—"
     return f"{n:,}c"
 
 async def variant_code_to_player_id(con: asyncpg.Connection, code: str) -> Optional[int]:
-    row = await con.fetchrow("SELECT id FROM fut_players WHERE variant_code = $1 OR version_id::text = $1 LIMIT 1", code)
+    row = await con.fetchrow(
+        "SELECT id FROM fut_players WHERE variant_code = $1 OR version_id::text = $1 LIMIT 1",
+        code
+    )
     return row["id"] if row else None
 
 DEFAULT_SLOTS = [
@@ -124,7 +132,6 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
     total = 0
     cards = []
     async with pool.acquire() as con:
-        # basic order to fill slots
         ordered = players[:11]
         for idx, p in enumerate(ordered):
             code = p.get("variant_code")
@@ -133,40 +140,41 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
             total += (price or 0)
             name = p.get("name") or f"#{code}"
             price_txt = format_coins(price)
-            x,y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50,50)
-            cards.append({"x":x,"y":y,"name":name,"price_txt":price_txt})
+            x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
+            cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
 
     total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
 
-    # Build HTML
     from html import escape
-    head = """
-<!doctype html>
-<html><head><meta charset='utf-8'><title>Pitch</title>
-<style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0a1a0a;color:#fff;margin:0}
-.wrap{max-width:1080px;margin:0 auto;padding:16px}
-h1{font-size:20px;margin:0 0 8px}
-.subtitle{opacity:.8;margin-bottom:16px}
-.pitch{position:relative;width:100%;padding-top:62%;background:linear-gradient(#0f4d0f,#0b390b);border:2px solid #1f5f1f;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.3);margin-bottom:16px}
-.slot{position:absolute;width:12%;transform:translate(-50%,-50%);text-align:center}
-.card{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:6px 6px 8px}
-.name{font-size:12px;line-height:1.2;margin-top:4px}
-.price{font-size:12px;opacity:.9}
-.total{font-weight:700;font-size:16px;margin-top:8px}
-</style></head><body><div class='wrap'>
-"""
-    title_html = f"<h1>{escape(entry.title)} — {escape(challenge)}</h1>"
-    subtitle = f"<div class='subtitle'>{escape(chall.coin_text or '')}</div>"
-    pitch_open = "<div class='pitch'>"
     slots_html = ""
     for c in cards:
-        slots_html += f\"\"\"<div class='slot' style='left:{c["x"]}%;top:{c["y"]}%;'>
-  <div class='card'><div class='price'>{escape(c["price_txt"])}</div><div class='name'>{escape(c["name"])}</div></div>
-</div>\"\"\"
-    pitch_close = "</div>"
-    total_html = f"<div class='total'>Total: {escape(total_txt)}</div>"
-    foot = "</div></body></html>"
+        slots_html += (
+            f"<div class='slot' style='left:{c['x']}%;top:{c['y']}%;'>"
+            f"<div class='card'><div class='price'>{escape(c['price_txt'])}</div>"
+            f"<div class='name'>{escape(c['name'])}</div></div></div>"
+        )
 
-    html = head + title_html + subtitle + pitch_open + slots_html + pitch_close + total_html + foot
+    html = f"""
+<!doctype html>
+<html><head><meta charset='utf-8'><title>{escape(entry.title)} — {escape(challenge)}</title>
+<style>
+body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0a1a0a;color:#fff;margin:0}}
+.wrap{{max-width:1080px;margin:0 auto;padding:16px}}
+h1{{font-size:20px;margin:0 0 8px}}
+.subtitle{{opacity:.8;margin-bottom:16px}}
+.pitch{{position:relative;width:100%;padding-top:62%;background:linear-gradient(#0f4d0f,#0b390b);border:2px solid #1f5f1f;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.3);margin-bottom:16px}}
+.slot{{position:absolute;width:12%;transform:translate(-50%,-50%);text-align:center}}
+.card{{background:rgba(0,0,0,.25);border:1px solid rgba(255,255,255,.15);border-radius:12px;padding:6px 6px 8px}}
+.name{{font-size:12px;line-height:1.2;margin-top:4px}}
+.price{{font-size:12px;opacity:.9}}
+.total{{font-weight:700;font-size:16px;margin-top:8px}}
+</style></head><body><div class='wrap'>
+<h1>{escape(entry.title)} — {escape(challenge)}</h1>
+<div class='subtitle'>{escape(chall.coin_text or '')}</div>
+<div class='pitch'>
+{slots_html}
+</div>
+<div class='total'>Total: {escape(total_txt)}</div>
+</div></body></html>
+"""
     return HTMLResponse(content=html, status_code=200)
