@@ -123,7 +123,7 @@ DEFAULT_SLOTS = [
 ]
 
 def _render_pitch_html(title: str, subtitle: str, cards: List[Dict[str, Any]], total_txt: str) -> str:
-    slots_html = "".48join(
+    slots_html = "".join(
         f"<div class='slot' style='left:{c['x']}%;top:{c['y']}%;'>"
         f"<div class='card'><div class='price'>{escape(c['price_txt'])}</div>"
         f"<div class='name'>{escape(c['name'])}</div></div></div>"
