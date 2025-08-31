@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from html import escape
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
@@ -10,16 +11,12 @@ import asyncpg
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
-import re
-
-def normalize_version_id(code: str | int | None) -> str:
-    """Digits-only version of any code; strips things like '25-' prefixes."""
-    return re.sub(r"\D", "", str(code or ""))
 
 from app.services.sbc_solution_scraper import (
     list_sbc_player_slugs,
     parse_sbc_page,
     parse_solution_players,
+    normalize_version_id,  # use same normalizer
 )
 
 # Price service: if you don't have it yet, this stub returns None
@@ -65,13 +62,24 @@ def format_coins(n: Optional[int]) -> str:
         return "—"
     return f"{n:,}c"
 
-async def variant_code_to_player_id(con: asyncpg.Connection, code: str) -> Optional[int]:
-    # 👇 change columns to match your schema (variant/version id)
-    row = await con.fetchrow(
-        "SELECT id FROM fut_players WHERE variant_code = $1 OR version_id::text = $1 LIMIT 1",
-        code,
-    )
-    return row["id"] if row else None
+async def lookup_player_by_card_id(con: asyncpg.Connection, version_code: str) -> tuple[Optional[int], Optional[str]]:
+    """
+    Map digits-only version/resource id to your players table:
+    fut_players.card_id (text cast).
+    Returns (player_id, display_name).
+    """
+    v = normalize_version_id(version_code)
+    if not v:
+        return None, None
+    try:
+        row = await con.fetchrow("SELECT id, name FROM fut_players WHERE card_id::text = $1 LIMIT 1", v)
+    except Exception:
+        return None, None
+    if not row:
+        return None, None
+    # Some schemas may have different display columns; adjust if needed
+    name = row.get("name") or row.get("full_name") or row.get("common_name")
+    return row["id"], name
 
 DEFAULT_SLOTS = [
     (50, 92),  # GK
@@ -157,13 +165,13 @@ async def ingest_all(payload: IngestIn):
                             try:
                                 players = await parse_solution_players(s, ch.view_solution_url)
                             except Exception as e:
-                                players = [{"name": "ERROR", "variant_code": f"solution_fetch_failed: {e}"}]
+                                players = [{"name": "ERROR", "variant_code": f"solution_fetch_failed:{e}"}]
                             for p in players:
                                 await con.execute(
                                     """INSERT INTO sbc_challenge_players (challenge_id,variant_code,name)
                                        VALUES ($1,$2,$3)
                                        ON CONFLICT (challenge_id,variant_code) DO NOTHING""",
-                                    cid, p.get("variant_code"), p.get("name")
+                                    cid, normalize_version_id(p.get("variant_code")), p.get("name")
                                 )
         return {"ok": True, "ingested": len(slugs)}
     except Exception as e:
@@ -214,7 +222,7 @@ async def sbc_challenges(path: str):
 async def sbc_challenges_alias(path: str):
     return await sbc_challenges(path)
 
-# Debug: show what players we parsed from a solution URL
+# Debug: show parsed players (digits-only codes)
 @router.get("/debug/solution-players")
 async def debug_solution_players(solution_url: str):
     solution_url = urljoin("https://www.fut.gg", solution_url)
@@ -222,7 +230,7 @@ async def debug_solution_players(solution_url: str):
         players = await parse_solution_players(s, solution_url)
     return {
         "count": len(players),
-        "variant_codes": [p.get("variant_code") for p in players],
+        "variant_codes": [normalize_version_id(p.get("variant_code")) for p in players],
         "sample": players[:11],
     }
 
@@ -253,7 +261,6 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
         players = await parse_solution_players(s, chall.view_solution_url)
 
     if not players:
-        # Helpful hint + debug route for this exact URL
         raise HTTPException(
             status_code=502,
             detail="Parsed 0 players from the solution page. "
@@ -266,11 +273,11 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
     async with pool.acquire() as con:
         ordered = players[:11]
         for idx, p in enumerate(ordered):
-            code = p.get("variant_code")
-            pid = await variant_code_to_player_id(con, code) if code else None
+            code = normalize_version_id(p.get("variant_code"))
+            pid, dbname = await lookup_player_by_card_id(con, code)
             price = await get_player_price(pid, platform=platform) if pid is not None else None
             total += (price or 0)
-            name = p.get("name") or f"#{code}"
+            name = (p.get("name") or dbname or f"#{code}")
             price_txt = format_coins(price)
             x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
             cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
@@ -299,11 +306,11 @@ async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
     async with pool.acquire() as con:
         ordered = players[:11]
         for idx, p in enumerate(ordered):
-            code = p.get("variant_code")
-            pid = await variant_code_to_player_id(con, code) if code else None
+            code = normalize_version_id(p.get("variant_code"))
+            pid, dbname = await lookup_player_by_card_id(con, code)
             price = await get_player_price(pid, platform=platform) if pid is not None else None
             total += (price or 0)
-            name = p.get("name") or f"#{code}"
+            name = (p.get("name") or dbname or f"#{code}")
             price_txt = format_coins(price)
             x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
             cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
