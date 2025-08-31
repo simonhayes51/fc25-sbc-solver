@@ -3,8 +3,8 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
+from urllib.parse import urljoin
 import os
-
 import asyncpg
 import aiohttp
 from html import escape
@@ -198,16 +198,33 @@ async def sbc_challenges(path: str):
 async def sbc_challenges_alias(path: str):
     return await sbc_challenges(path)
 
-# Render by SBC slug + challenge name
+# Render by SBC slug + challenge name (lenient matching across duplicate names)
 @router.get("/render", response_class=HTMLResponse)
 async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
     async with aiohttp.ClientSession() as s:
         entry = await parse_sbc_page(s, slug)
-        chall = next((c for c in entry.challenges if c.name.lower() == challenge.lower()), None)
+
+        wanted = challenge.lower().strip()
+        chall = next((c for c in entry.challenges
+                      if c.name.lower().strip() == wanted and c.view_solution_url), None)
+        if not chall:
+            chall = next((c for c in entry.challenges
+                          if c.name.lower().strip() == wanted), None)
+        if chall and not chall.view_solution_url:
+            twin = next((c for c in entry.challenges
+                         if c.name.lower().strip() == wanted and c.view_solution_url), None)
+            if twin:
+                chall = twin
+        if not chall or not chall.view_solution_url:
+            any_with_link = next((c for c in entry.challenges if c.view_solution_url), None)
+            if any_with_link:
+                chall = any_with_link
+
         if not chall:
             raise HTTPException(404, f"Challenge '{challenge}' not found")
         if not chall.view_solution_url:
             raise HTTPException(404, "No View Solution URL on this challenge")
+
         players = await parse_solution_players(s, chall.view_solution_url)
 
     pool = await get_pool()
@@ -226,12 +243,13 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
             cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
 
     total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
-    html = _render_pitch_html(f"{entry.title} — {challenge}", chall.coin_text or "", cards, total_txt)
+    html = _render_pitch_html(f"{slug} — {challenge}", "", cards, total_txt)
     return HTMLResponse(content=html, status_code=200)
 
-# Render directly from a squad-builder URL
+# Render directly from a squad-builder URL (accepts relative or absolute)
 @router.get("/render-by-url", response_class=HTMLResponse)
 async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
+    solution_url = urljoin("https://www.fut.gg", solution_url)
     async with aiohttp.ClientSession() as s:
         players = await parse_solution_players(s, solution_url)
 
@@ -254,7 +272,7 @@ async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
     html = _render_pitch_html("Solution Pitch", "", cards, total_txt)
     return HTMLResponse(content=html, status_code=200)
 
-# Optional: schema peek to confirm columns
+# Optional: schema peek
 @router.get("/debug/schema")
 async def debug_schema():
     pool = await get_pool()
