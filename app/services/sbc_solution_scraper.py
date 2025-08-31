@@ -27,7 +27,8 @@ class SbcEntry:
 
 # ---------- Regex ----------
 PLAYER_ANCHOR_RE = re.compile(r"/players/\d+(?:-[^/]+)?/25-(\d+)(?:/|$)")
-_COINS_RE = re.compile(r"([\d,]+)\s*(?:Image:\s*)?(?:FC\s*Coin|Coins?)", re.IGNORECASE)
+COINS_RE = re.compile(r"([\d,]+)\s*(?:Image:\s*)?(?:FC\s*Coin|Coins?)", re.IGNORECASE)
+IMAGE_SRC_CODE_RE = re.compile(r"/player-item/25-(\d+)")  # extract 25-<digits> from image path
 
 # ---------- Utils ----------
 def normalize_version_id(code: str | int | None) -> str:
@@ -41,8 +42,8 @@ def _clean(s: str) -> str:
 async def _fetch(session: aiohttp.ClientSession, url: str) -> str:
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
         ),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-GB,en;q=0.9",
@@ -125,7 +126,7 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
                     view_solution_url = urljoin(FUTGG_BASE, node["href"])
 
         block_text = _clean(" ".join(text_parts))
-        m = _COINS_RE.search(block_text or "")
+        m = COINS_RE.search(block_text or "")
         coin_text = m.group(1) if m else None
 
         if view_solution_url or "min." in (block_text or "").lower() or "rated squad" in (name or "").lower():
@@ -138,7 +139,7 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
                 )
             )
 
-    # Fallback: map global /squad-builder/ anchors to nearest header
+    # Fallback: map any global view-solution button to nearest header
     if not any(c.view_solution_url for c in challenges):
         for a in soup.find_all("a", href=True):
             if _is_view_solution_anchor(a):
@@ -150,7 +151,7 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
                             c.view_solution_url = urljoin(FUTGG_BASE, a["href"])
                             break
 
-    # Prefer entries with links when duplicate names exist
+    # prefer entries with links when duplicate names exist
     seen_by_name: Dict[str, ChallengeBlock] = {}
     for c in challenges:
         key = c.name.lower().strip()
@@ -160,20 +161,43 @@ async def parse_sbc_page(session: aiohttp.ClientSession, slug: str) -> SbcEntry:
 
     return SbcEntry(slug=slug.strip("/"), title=title, challenges=challenges)
 
-# ---------- Solution page -> players ----------
+# ---------- helpers to merge anchors + images ----------
+def _merge_players(players: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Dedup by variant_code (if present) else by normalized image_url, keep first occurrence.
+    """
+    out: List[Dict[str, str]] = []
+    seen_codes, seen_imgs = set(), set()
+    for p in players:
+        code = p.get("variant_code") or ""
+        img = p.get("image_url") or ""
+        key_img = img.strip()
+        if code:
+            if code in seen_codes:
+                # enrich existing (attach image if missing)
+                for q in out:
+                    if q.get("variant_code") == code and img and not q.get("image_url"):
+                        q["image_url"] = img
+                continue
+            seen_codes.add(code)
+        elif key_img:
+            if key_img in seen_imgs:
+                continue
+            seen_imgs.add(key_img)
+        out.append(p)
+    return out
+
+# ---------- Solution page -> players (fast HTTP) ----------
 async def _parse_solution_players_http(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
-    """
-    Fast path: parse raw HTML for anchors like /players/.../25-<digits>/
-    (works only if links are server-rendered).
-    """
     solution_url = urljoin(FUTGG_BASE, solution_url)
     html = await _fetch(session, solution_url)
     soup = BeautifulSoup(html, "html.parser")
 
     raw: List[Dict[str, str]] = []
+
+    # 1) anchors
     for a in soup.find_all("a", href=True):
-        href = a["href"]
-        path = urlparse(href).path
+        path = urlparse(a["href"]).path
         m = PLAYER_ANCHOR_RE.search(path or "")
         if not m:
             continue
@@ -181,29 +205,66 @@ async def _parse_solution_players_http(session: aiohttp.ClientSession, solution_
         name = a.get_text(" ", strip=True) or path
         raw.append({"name": name, "href": path, "variant_code": code})
 
-    # de-dup by variant_code, preserve order
-    out, seen = [], set()
-    for p in raw:
-        vc = p["variant_code"]
-        if vc and vc not in seen:
-            out.append(p); seen.add(vc)
-    return out
+    # 2) images (attach to same code if present; else add image-only)
+    for img in soup.find_all("img", src=True):
+        src = img["src"]
+        if "/player-item/" not in src:
+            continue
+        # absolute URL preferred
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = f"https://{urlparse(solution_url).netloc}{src}"
+        code = None
+        m = IMAGE_SRC_CODE_RE.search(urlparse(src).path)
+        if m:
+            code = normalize_version_id(m.group(1))
+        name = (img.get("alt") or "").strip()
+        entry = {"name": name, "href": "", "variant_code": code or "", "image_url": src}
+        raw.append(entry)
 
+    return _merge_players(raw)
+
+# ---------- Solution page -> players (robust Playwright) ----------
 async def _parse_solution_players_browser(solution_url: str) -> List[Dict[str, str]]:
-    """
-    Slow but robust: use Playwright to render, then collect the same anchors.
-    """
     browser = await get_browser()
-    context = await browser.new_context(ignore_https_errors=True)
+    context = await browser.new_context(ignore_https_errors=True, user_agent=(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    ))
     page = await context.new_page()
     try:
         url = urljoin(FUTGG_BASE, solution_url)
         await page.goto(url, wait_until="networkidle", timeout=45000)
-        # Give React time to hydrate, then query anchors
-        await page.wait_for_timeout(300)  # small safety delay
+        await page.wait_for_timeout(600)
 
-        anchors = await page.query_selector_all("a[href*='/players/'][href*='/25-']")
         raw: List[Dict[str, str]] = []
+
+        # 1) Pull anchors from __NEXT_DATA__ JSON (even if not in DOM yet)
+        data = await page.evaluate("""
+        () => {
+          const dump = JSON.stringify(window.__NEXT_DATA__ || {}, null, 0);
+          const re = /\\/players\\/\\d+(?:-[^\\/]+)?\\/25-(\\d+)(?:\\/|$)/g;
+          const seen = new Set();
+          const out = [];
+          let m;
+          while ((m = re.exec(dump)) !== null) {
+            const full = m[0];
+            const code = m[1].replace(/^0+/, "");
+            if (!seen.has(code)) {
+              out.push({ href: full, variant_code: code });
+              seen.add(code);
+            }
+          }
+          return out;
+        }
+        """)
+        for item in data or []:
+            path = urlparse(item["href"]).path
+            code = normalize_version_id(item["variant_code"])
+            raw.append({"name": "", "href": path, "variant_code": code})
+
+        # 2) DOM anchors (if available)
+        anchors = await page.query_selector_all("a[href*='/players/'][href*='/25-']")
         for a in anchors:
             href = (await a.get_attribute("href")) or ""
             path = urlparse(href).path
@@ -214,23 +275,29 @@ async def _parse_solution_players_browser(solution_url: str) -> List[Dict[str, s
             text = (await a.inner_text()) or path
             raw.append({"name": text.strip(), "href": path, "variant_code": code})
 
-        # de-dup by variant_code, preserve order
-        out, seen = [], set()
-        for p in raw:
-            vc = p["variant_code"]
-            if vc and vc not in seen:
-                out.append(p); seen.add(vc)
-        return out
+        # 3) Card images with /player-item/
+        imgs = await page.query_selector_all("img[src*='/player-item/']")
+        for img in imgs:
+            src = (await img.get_attribute("src")) or ""
+            alt = (await img.get_attribute("alt")) or ""
+            code = None
+            m = IMAGE_SRC_CODE_RE.search(urlparse(src).path)
+            if m:
+                code = normalize_version_id(m.group(1))
+            raw.append({"name": alt.strip(), "href": "", "variant_code": code or "", "image_url": src})
+
+        return _merge_players(raw)
     finally:
         await context.close()
 
+# ---------- Public: solution page -> players ----------
 async def parse_solution_players(session: aiohttp.ClientSession, solution_url: str) -> List[Dict[str, str]]:
     """
-    Public API: try fast HTTP parse first; if nothing found, fall back to headless browser.
-    Always returns players from anchors like /players/.../25-<digits>/ with digits-only codes.
+    Returns list of dicts with:
+      - variant_code: digits after 25- (if present), '' otherwise
+      - image_url: card image URL if present
     """
     players = await _parse_solution_players_http(session, solution_url)
     if players:
         return players
-    # Fallback to browser render
     return await _parse_solution_players_browser(solution_url)
