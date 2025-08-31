@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-import re
 from html import escape
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
@@ -16,7 +15,9 @@ from app.services.sbc_solution_scraper import (
     list_sbc_player_slugs,
     parse_sbc_page,
     parse_solution_players,
-    normalize_version_id,  # use same normalizer
+    fetch_solution_html,
+    extract_candidate_card_ids_from_text,
+    normalize_version_id,
 )
 
 # Price service: if you don't have it yet, this stub returns None
@@ -77,9 +78,21 @@ async def lookup_player_by_card_id(con: asyncpg.Connection, version_code: str) -
         return None, None
     if not row:
         return None, None
-    # Some schemas may have different display columns; adjust if needed
     name = row.get("name") or row.get("full_name") or row.get("common_name")
     return row["id"], name
+
+async def filter_existing_card_ids(con: asyncpg.Connection, candidates: List[str]) -> List[str]:
+    """Return the subset of candidate IDs that actually exist in fut_players.card_id."""
+    if not candidates:
+        return []
+    # cast everything to text for the ANY() compare
+    rows = await con.fetch(
+        "SELECT card_id::text AS id FROM fut_players WHERE card_id::text = ANY($1::text[])",
+        [normalize_version_id(x) for x in candidates]
+    )
+    existing = {r["id"] for r in rows}
+    # preserve original order
+    return [normalize_version_id(x) for x in candidates if normalize_version_id(x) in existing]
 
 DEFAULT_SLOTS = [
     (50, 92),  # GK
@@ -234,7 +247,68 @@ async def debug_solution_players(solution_url: str):
         "sample": players[:11],
     }
 
-# Render by SBC slug + challenge name (lenient across duplicate names)
+# Debug: show candidate IDs from raw HTML and which exist in DB
+@router.get("/debug/solution-ids")
+async def debug_solution_ids(solution_url: str):
+    solution_url = urljoin("https://www.fut.gg", solution_url)
+    async with aiohttp.ClientSession() as s:
+        html = await fetch_solution_html(s, solution_url)
+    pool = await get_pool()
+    async with pool.acquire() as con:
+        candidates = extract_candidate_card_ids_from_text(html)
+        existing = await filter_existing_card_ids(con, candidates)
+    return {
+        "candidates_count": len(candidates),
+        "existing_count": len(existing),
+        "candidates_sample": candidates[:25],
+        "existing_sample": existing[:25],
+    }
+
+# -------- Shared render core (uses DB-verified fallback if needed) --------
+async def _render_from_solution_url(solution_url: str, platform: str = "ps") -> str:
+    solution_url = urljoin("https://www.fut.gg", solution_url)
+
+    async with aiohttp.ClientSession() as s:
+        players = await parse_solution_players(s, solution_url)
+
+        # Fallback: no players -> scan raw HTML for candidate IDs and verify against DB
+        candidate_codes: List[str] = []
+        if not players:
+            html = await fetch_solution_html(s, solution_url)
+            candidate_codes = extract_candidate_card_ids_from_text(html)
+
+    pool = await get_pool()
+    total = 0
+    cards: List[Dict[str, Any]] = []
+    async with pool.acquire() as con:
+        # If we got players list, use it; else use DB-verified candidate codes
+        ordered: List[Dict[str, Any]] = players[:11] if players else []
+        if not ordered and candidate_codes:
+            existing = await filter_existing_card_ids(con, candidate_codes)
+            # shape them like players
+            ordered = [{"name": "", "variant_code": code, "href": "", "position": ""} for code in existing[:11]]
+
+        if not ordered:
+            raise HTTPException(
+                status_code=502,
+                detail="Could not identify any players from the solution page (even via DB-verified fallback). "
+                       "Try /api/sbc2/debug/solution-ids?solution_url=<same-url> to inspect candidates."
+            )
+
+        for idx, p in enumerate(ordered):
+            code = normalize_version_id(p.get("variant_code"))
+            pid, dbname = await lookup_player_by_card_id(con, code)
+            price = await get_player_price(pid, platform=platform) if pid is not None else None
+            total += (price or 0)
+            name = (p.get("name") or dbname or f"#{code}")
+            price_txt = format_coins(price)
+            x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
+            cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
+
+    total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
+    return _render_pitch_html("Solution Pitch", "", cards, total_txt)
+
+# Render by SBC slug + challenge name
 @router.get("/render", response_class=HTMLResponse)
 async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
     async with aiohttp.ClientSession() as s:
@@ -258,65 +332,15 @@ async def render_pitch(slug: str, challenge: str, platform: str = "ps"):
         if not chall.view_solution_url:
             raise HTTPException(404, "No View Solution URL on this challenge")
 
-        players = await parse_solution_players(s, chall.view_solution_url)
+        solution_url = chall.view_solution_url
 
-    if not players:
-        raise HTTPException(
-            status_code=502,
-            detail="Parsed 0 players from the solution page. "
-                   "Try /api/sbc2/debug/solution-players?solution_url=<same-url> to inspect."
-        )
-
-    pool = await get_pool()
-    total = 0
-    cards: List[Dict[str, Any]] = []
-    async with pool.acquire() as con:
-        ordered = players[:11]
-        for idx, p in enumerate(ordered):
-            code = normalize_version_id(p.get("variant_code"))
-            pid, dbname = await lookup_player_by_card_id(con, code)
-            price = await get_player_price(pid, platform=platform) if pid is not None else None
-            total += (price or 0)
-            name = (p.get("name") or dbname or f"#{code}")
-            price_txt = format_coins(price)
-            x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
-            cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
-
-    total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
-    html = _render_pitch_html(f"{slug} — {challenge}", "", cards, total_txt)
+    html = await _render_from_solution_url(solution_url, platform=platform)
     return HTMLResponse(content=html, status_code=200)
 
 # Render directly from a squad-builder URL (accepts relative or absolute)
 @router.get("/render-by-url", response_class=HTMLResponse)
 async def render_by_url(solution_url: str = Query(...), platform: str = "ps"):
-    solution_url = urljoin("https://www.fut.gg", solution_url)
-    async with aiohttp.ClientSession() as s:
-        players = await parse_solution_players(s, solution_url)
-
-    if not players:
-        raise HTTPException(
-            status_code=502,
-            detail="Parsed 0 players from the solution page. "
-                   "Try /api/sbc2/debug/solution-players?solution_url=<same-url> to inspect."
-        )
-
-    pool = await get_pool()
-    total = 0
-    cards: List[Dict[str, Any]] = []
-    async with pool.acquire() as con:
-        ordered = players[:11]
-        for idx, p in enumerate(ordered):
-            code = normalize_version_id(p.get("variant_code"))
-            pid, dbname = await lookup_player_by_card_id(con, code)
-            price = await get_player_price(pid, platform=platform) if pid is not None else None
-            total += (price or 0)
-            name = (p.get("name") or dbname or f"#{code}")
-            price_txt = format_coins(price)
-            x, y = DEFAULT_SLOTS[idx] if idx < len(DEFAULT_SLOTS) else (50, 50)
-            cards.append({"x": x, "y": y, "name": name, "price_txt": price_txt})
-
-    total_txt = format_coins(total) if any(c["price_txt"] != "—" for c in cards) else "—"
-    html = _render_pitch_html("Solution Pitch", "", cards, total_txt)
+    html = await _render_from_solution_url(solution_url, platform=platform)
     return HTMLResponse(content=html, status_code=200)
 
 # Optional: schema peek
